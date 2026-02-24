@@ -102,6 +102,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::select;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -697,6 +698,11 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
+    http_server_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Bounded ring buffer of HTTP server log entries shared with the TUI overlay.
+    http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>>,
+    /// Dynamic config for the HTTP proxy server (model, provider, reasoning effort).
+    http_server_dynamic_config: Arc<RwLock<crate::http_server::HttpServerDynamicConfig>>,
 }
 
 #[derive(Default)]
@@ -1730,6 +1736,22 @@ impl App {
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        // Extract values needed for the HTTP server dynamic config before `config` is moved
+        // into the App struct.
+        let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let http_server_dynamic_config =
+            Arc::new(RwLock::new(crate::http_server::HttpServerDynamicConfig {
+                model: config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-5.3-codex".to_string()),
+                provider: config.model_provider.clone(),
+                reasoning_effort: config.model_reasoning_effort,
+                reasoning_summary: config.model_reasoning_summary,
+                ws_version: codex_core::ws_version_from_features(&config),
+            }));
+
         let mut app = Self {
             server: thread_manager.clone(),
             otel_manager: otel_manager.clone(),
@@ -1766,6 +1788,9 @@ impl App {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            http_server_handle: None,
+            http_server_log_buffer,
+            http_server_dynamic_config,
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -2252,10 +2277,12 @@ impl App {
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort);
                 self.refresh_status_line();
+                self.http_server_dynamic_config.write().await.reasoning_effort = effort;
             }
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
+                self.http_server_dynamic_config.write().await.model = model;
             }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);
@@ -3218,6 +3245,38 @@ impl App {
             }
             AppEvent::StatusLineSetupCancelled => {
                 self.chat_widget.cancel_status_line_setup();
+            }
+            AppEvent::SetHttpServerEnabled(enable) => {
+                if enable {
+                    if self.http_server_handle.is_none() {
+                        let state = Arc::new(crate::http_server::HttpServerState {
+                            auth_manager: self.auth_manager.clone(),
+                            dynamic_config: self.http_server_dynamic_config.clone(),
+                            log_buffer: self.http_server_log_buffer.clone(),
+                            otel_manager: self.otel_manager.clone(),
+                        });
+                        let router = crate::http_server::build_router(state);
+                        let handle = tokio::spawn(async move {
+                            if let Ok(listener) =
+                                tokio::net::TcpListener::bind("127.0.0.1:8082").await
+                            {
+                                let _ = axum::serve(listener, router).await;
+                            }
+                        });
+                        self.http_server_handle = Some(handle);
+                        self.chat_widget.set_http_server_running(true);
+                    }
+                } else {
+                    if let Some(handle) = self.http_server_handle.take() {
+                        handle.abort();
+                    }
+                    self.chat_widget.set_http_server_running(false);
+                }
+            }
+            AppEvent::ShowHttpServerLogs => {
+                self.overlay = Some(crate::pager_overlay::Overlay::Logs(
+                    crate::logs_overlay::LogsOverlay::new(self.http_server_log_buffer.clone()),
+                ));
             }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = codex_core::config::edit::syntax_theme_edit(&name);
@@ -5249,6 +5308,19 @@ mod tests {
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         let model = codex_core::test_support::get_model_offline(config.model.as_deref());
         let otel_manager = test_otel_manager(&config, model.as_str());
+        let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let http_server_dynamic_config =
+            Arc::new(RwLock::new(crate::http_server::HttpServerDynamicConfig {
+                model: config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-5.3-codex".to_string()),
+                provider: config.model_provider.clone(),
+                reasoning_effort: config.model_reasoning_effort,
+                reasoning_summary: config.model_reasoning_summary,
+                ws_version: None,
+            }));
 
         App {
             server,
@@ -5286,6 +5358,9 @@ mod tests {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            http_server_handle: None,
+            http_server_log_buffer,
+            http_server_dynamic_config,
         }
     }
 
@@ -5308,6 +5383,19 @@ mod tests {
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         let model = codex_core::test_support::get_model_offline(config.model.as_deref());
         let otel_manager = test_otel_manager(&config, model.as_str());
+        let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let http_server_dynamic_config =
+            Arc::new(RwLock::new(crate::http_server::HttpServerDynamicConfig {
+                model: config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-5.3-codex".to_string()),
+                provider: config.model_provider.clone(),
+                reasoning_effort: config.model_reasoning_effort,
+                reasoning_summary: config.model_reasoning_summary,
+                ws_version: None,
+            }));
 
         (
             App {
@@ -5346,6 +5434,9 @@ mod tests {
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
+                http_server_handle: None,
+                http_server_log_buffer,
+                http_server_dynamic_config,
             },
             rx,
             op_rx,

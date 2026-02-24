@@ -452,6 +452,12 @@ pub(crate) enum AppEvent {
     SyntaxThemeSelected {
         name: String,
     },
+
+    /// Start or stop the local HTTP server on port 8082.
+    SetHttpServerEnabled(bool),
+
+    /// Open the HTTP server logs overlay.
+    ShowHttpServerLogs,
 }
 
 /// The exit strategy requested by the UI layer.

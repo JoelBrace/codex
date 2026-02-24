@@ -48,6 +48,7 @@ use ratatui::widgets::Wrap;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    Logs(crate::logs_overlay::LogsOverlay),
 }
 
 impl Overlay {
@@ -70,6 +71,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::Logs(o) => o.handle_event(tui, event),
         }
     }
 
@@ -77,7 +79,15 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::Logs(o) => o.is_done(),
         }
+    }
+
+    /// Whether this overlay handles Esc itself (rather than passing it to the
+    /// backtrack machinery).  `Logs` overlays close on Esc; transcript overlays
+    /// use Esc to enter backtrack-preview mode.
+    pub(crate) fn handles_esc_directly(&self) -> bool {
+        matches!(self, Overlay::Logs(_))
     }
 }
 

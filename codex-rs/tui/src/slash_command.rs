@@ -21,6 +21,8 @@ pub enum SlashCommand {
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
+    #[strum(serialize = "http-server")]
+    HttpServer,
     Skills,
     Review,
     Rename,
@@ -104,6 +106,7 @@ impl SlashCommand {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
+            SlashCommand::HttpServer => "manage the local HTTP server: /http-server [on|off|status|logs]",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Logout => "log out of Codex",
@@ -127,6 +130,7 @@ impl SlashCommand {
                 | SlashCommand::Plan
                 | SlashCommand::Fast
                 | SlashCommand::SandboxReadRoot
+                | SlashCommand::HttpServer
         )
     }
 
@@ -147,6 +151,7 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
+            | SlashCommand::HttpServer
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Clear

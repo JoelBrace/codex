@@ -156,8 +156,18 @@ impl App {
             ..
         }) = event
         {
-            // First Esc in transcript overlay: begin backtrack preview at latest user message.
-            self.begin_overlay_backtrack_preview(tui);
+            // If the overlay handles Esc directly (e.g. LogsOverlay), forward it
+            // so the overlay can close itself.  Otherwise begin backtrack preview.
+            let handles_directly = self
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.handles_esc_directly());
+            if handles_directly {
+                self.overlay_forward_event(tui, event)?;
+            } else {
+                // First Esc in transcript overlay: begin backtrack preview.
+                self.begin_overlay_backtrack_preview(tui);
+            }
             Ok(true)
         } else {
             // Not in backtrack mode: forward events to the overlay widget.

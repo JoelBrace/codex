@@ -698,6 +698,7 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
+    http_server_running: bool,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -3153,6 +3154,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            http_server_running: false,
         };
 
         widget.prefetch_rate_limits();
@@ -3335,6 +3337,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            http_server_running: false,
         };
 
         widget.prefetch_rate_limits();
@@ -3509,6 +3512,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            http_server_running: false,
         };
 
         widget.prefetch_rate_limits();
@@ -3946,6 +3950,12 @@ impl ChatWidget {
             SlashCommand::Experimental => {
                 self.open_experimental_popup();
             }
+            SlashCommand::HttpServer => {
+                self.add_info_message(
+                    "Usage: /http-server [on|off|status]".to_string(),
+                    None,
+                );
+            }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.request_quit_without_confirmation();
             }
@@ -4212,6 +4222,14 @@ impl ChatWidget {
                         path: prepared_args,
                     });
                 self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::HttpServer => {
+                let Some((prepared_args, _)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.handle_http_server_command(&prepared_args);
             }
             _ => self.dispatch_command(cmd),
         }
@@ -6551,6 +6569,46 @@ impl ChatWidget {
             header: Box::new(()),
             ..Default::default()
         });
+    }
+
+    pub(crate) fn handle_http_server_command(&mut self, arg: &str) {
+        match arg {
+            "on" => {
+                self.app_event_tx
+                    .send(AppEvent::SetHttpServerEnabled(true));
+                self.add_info_message(
+                    "HTTP server started at localhost:8082 — POST /v1/messages is available"
+                        .to_string(),
+                    None,
+                );
+            }
+            "off" => {
+                self.app_event_tx
+                    .send(AppEvent::SetHttpServerEnabled(false));
+                self.add_info_message("HTTP server stopped".to_string(), None);
+            }
+            "status" => {
+                let msg = if self.http_server_running {
+                    "HTTP server is running at localhost:8082 — POST /v1/messages is available"
+                        .to_string()
+                } else {
+                    "HTTP server is stopped".to_string()
+                };
+                self.add_info_message(msg, None);
+            }
+            "logs" => {
+                self.app_event_tx.send(AppEvent::ShowHttpServerLogs);
+            }
+            other => {
+                self.add_error_message(format!(
+                    "Unknown argument '{other}'. Usage: /http-server [on|off|status|logs]"
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn set_http_server_running(&mut self, running: bool) {
+        self.http_server_running = running;
     }
 
     pub(crate) fn open_experimental_popup(&mut self) {

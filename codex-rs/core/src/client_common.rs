@@ -45,6 +45,35 @@ pub struct Prompt {
 }
 
 impl Prompt {
+    /// Add a function tool from raw name, description and JSON schema value.
+    ///
+    /// This is exposed as a public API so callers outside the crate (e.g. the
+    /// HTTP server proxy) can build prompts with tools without requiring access
+    /// to the crate-private `ToolSpec` type.
+    pub fn add_function_tool(
+        &mut self,
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        use crate::tools::spec::parse_tool_input_schema;
+        use self::tools::{ResponsesApiTool, ToolSpec};
+        let schema = parse_tool_input_schema(&parameters)
+            .map_err(|e| anyhow::anyhow!("Invalid tool schema for '{}': {}", name, e))?;
+        self.tools.push(ToolSpec::Function(ResponsesApiTool {
+            name,
+            description,
+            strict: false,
+            parameters: schema,
+        }));
+        Ok(())
+    }
+
+    /// Set whether parallel tool calls are permitted.
+    pub fn set_parallel_tool_calls(&mut self, parallel: bool) {
+        self.parallel_tool_calls = parallel;
+    }
+
     pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
         let mut input = self.input.clone();
 

@@ -83,6 +83,8 @@ mod file_search;
 mod frames;
 mod get_git_diff;
 mod history_cell;
+mod http_server;
+mod logs_overlay;
 pub mod insert_history;
 mod key_hint;
 mod line_truncation;
