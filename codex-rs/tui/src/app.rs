@@ -3905,6 +3905,9 @@ impl App {
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
+        // Start HTTP server by default.
+        app.app_event_tx.send(AppEvent::SetHttpServerEnabled(true));
+
         #[cfg(not(debug_assertions))]
         let pre_loop_exit_reason = if let Some(latest_version) = upgrade_version {
             let control = app
