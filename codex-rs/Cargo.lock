@@ -2831,6 +2831,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "assert_matches",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
