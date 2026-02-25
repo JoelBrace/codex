@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::io::Result;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::http_server::HttpLogEntry;
 use crate::key_hint;
@@ -47,6 +48,8 @@ const KEY_Q: KeyBinding = key_hint::plain(KeyCode::Char('q'));
 pub(crate) struct LogsOverlay {
     log_buffer: Arc<Mutex<VecDeque<HttpLogEntry>>>,
     scroll_offset: usize,
+    follow_bottom: bool,
+    last_max_scroll: usize,
     pub(crate) is_done: bool,
 }
 
@@ -54,7 +57,9 @@ impl LogsOverlay {
     pub(crate) fn new(log_buffer: Arc<Mutex<VecDeque<HttpLogEntry>>>) -> Self {
         Self {
             log_buffer,
-            scroll_offset: usize::MAX, // start pinned to bottom
+            scroll_offset: 0,
+            follow_bottom: true,
+            last_max_scroll: 0,
             is_done: false,
         }
     }
@@ -82,6 +87,40 @@ impl LogsOverlay {
             }
         }
         lines
+    }
+
+    fn content_height(entries: &VecDeque<HttpLogEntry>) -> usize {
+        entries
+            .iter()
+            .map(|entry| {
+                if entry.status.is_some() || entry.error.is_some() {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    fn max_scroll_for_area(content_height: usize, area: Rect) -> usize {
+        let content_viewport_height = area.height.saturating_sub(3) as usize;
+        content_height.saturating_sub(content_viewport_height)
+    }
+
+    fn page_height_for_area(area: Rect) -> usize {
+        area.height.saturating_sub(4) as usize
+    }
+
+    fn effective_scroll_offset(&self, max_scroll: usize) -> usize {
+        if self.follow_bottom {
+            max_scroll
+        } else {
+            self.scroll_offset.min(max_scroll)
+        }
+    }
+
+    fn is_at_bottom(&self, max_scroll: usize) -> bool {
+        self.effective_scroll_offset(max_scroll) >= max_scroll
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -114,16 +153,14 @@ impl LogsOverlay {
             height: area.height.saturating_sub(3),
         };
 
-        // Clamp scroll_offset.
-        let max_scroll = content_height.saturating_sub(content_area.height as usize);
-        if self.scroll_offset == usize::MAX {
-            self.scroll_offset = max_scroll;
-        } else {
+        let max_scroll = Self::max_scroll_for_area(content_height, area);
+        self.last_max_scroll = max_scroll;
+        if !self.follow_bottom {
             self.scroll_offset = self.scroll_offset.min(max_scroll);
         }
 
         // Render visible lines.
-        let visible_start = self.scroll_offset.min(content_height);
+        let visible_start = self.effective_scroll_offset(max_scroll).min(content_height);
         let visible_lines: Vec<Line<'static>> = lines
             .into_iter()
             .skip(visible_start)
@@ -140,13 +177,13 @@ impl LogsOverlay {
             .dim()
             .render_ref(sep_rect, buf);
 
+        let effective_offset = self.effective_scroll_offset(max_scroll);
         let pct = if content_height == 0 {
             100u8
         } else if max_scroll == 0 {
             100
         } else {
-            ((self.scroll_offset.min(max_scroll) as f32 / max_scroll as f32) * 100.0).round()
-                as u8
+            ((effective_offset as f32 / max_scroll as f32) * 100.0).round() as u8
         };
         let pct_text = format!(" {}% ", pct);
         let pct_w = pct_text.chars().count() as u16;
@@ -170,30 +207,35 @@ impl LogsOverlay {
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         match event {
             TuiEvent::Key(key_event) => {
+                let max_scroll = self.last_max_scroll;
                 if KEY_ESC.is_press(key_event) || KEY_Q.is_press(key_event) {
                     self.is_done = true;
                 } else if KEY_UP.is_press(key_event) || KEY_K.is_press(key_event) {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    self.follow_bottom = false;
+                    self.scroll_offset = self.effective_scroll_offset(max_scroll).saturating_sub(1);
                 } else if KEY_DOWN.is_press(key_event) || KEY_J.is_press(key_event) {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    self.scroll_offset = self
+                        .effective_scroll_offset(max_scroll)
+                        .saturating_add(1)
+                        .min(max_scroll);
+                    self.follow_bottom = self.is_at_bottom(max_scroll);
                 } else if KEY_PAGE_UP.is_press(key_event) {
-                    let page = tui
-                        .terminal
-                        .viewport_area
-                        .height
-                        .saturating_sub(4) as usize;
-                    self.scroll_offset = self.scroll_offset.saturating_sub(page);
+                    let page = Self::page_height_for_area(tui.terminal.viewport_area);
+                    self.follow_bottom = false;
+                    self.scroll_offset = self.effective_scroll_offset(max_scroll).saturating_sub(page);
                 } else if KEY_PAGE_DOWN.is_press(key_event) || KEY_SPACE.is_press(key_event) {
-                    let page = tui
-                        .terminal
-                        .viewport_area
-                        .height
-                        .saturating_sub(4) as usize;
-                    self.scroll_offset = self.scroll_offset.saturating_add(page);
+                    let page = Self::page_height_for_area(tui.terminal.viewport_area);
+                    self.scroll_offset = self
+                        .effective_scroll_offset(max_scroll)
+                        .saturating_add(page)
+                        .min(max_scroll);
+                    self.follow_bottom = self.is_at_bottom(max_scroll);
                 } else if KEY_HOME.is_press(key_event) {
+                    self.follow_bottom = false;
                     self.scroll_offset = 0;
                 } else if KEY_END.is_press(key_event) {
-                    self.scroll_offset = usize::MAX;
+                    self.scroll_offset = max_scroll;
+                    self.follow_bottom = true;
                 }
                 tui.frame_requester().schedule_frame();
             }
@@ -201,6 +243,9 @@ impl LogsOverlay {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
+                if !self.is_done {
+                    tui.frame_requester().schedule_frame_in(Duration::from_millis(50));
+                }
             }
             _ => {}
         }
