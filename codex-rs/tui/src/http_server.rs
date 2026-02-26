@@ -72,6 +72,8 @@ const LOG_BUFFER_MAX: usize = 500;
 pub struct HttpLogEntry {
     pub timestamp: DateTime<Utc>,
     pub model: String,
+    pub reasoning_effort: ReasoningEffortConfig,
+    pub reasoning_source: String,
     pub items: usize,
     pub tools: Vec<String>,
     pub streaming: bool,
@@ -87,8 +89,10 @@ impl HttpLogEntry {
     pub fn request_line(&self) -> String {
         let tools = self.tools.join(",");
         format!(
-            "[codex] → model={} items={} tools=[{}] client={}",
+            "[codex] → model={} effort={} effort_src={} items={} tools=[{}] client={}",
             self.model,
+            self.reasoning_effort,
+            self.reasoning_source,
             self.items,
             tools,
             if self.streaming { "stream" } else { "sync" },
@@ -475,7 +479,28 @@ async fn handle_messages(
         )
     };
 
-    // Determine effort from request's thinking block if present.
+    // Resolve reasoning effort for logs.
+    let model_info = proxy_model_info(&model);
+    let request_budget_effort = req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens)
+        .map(budget_to_effort);
+    let (resolved_reasoning_effort, reasoning_source) = if let Some(effort) = request_budget_effort {
+        (effort, "thinking".to_string())
+    } else if let Some(effort) = reasoning_effort {
+        (effort, "config".to_string())
+    } else {
+        (
+            model_info
+                .default_reasoning_level
+                .unwrap_or(ReasoningEffortConfig::Medium),
+            "model_default".to_string(),
+        )
+    };
+
+    // Keep stream behavior unchanged: request thinking override (with fallback budget),
+    // then dynamic config override.
     let effort = req
         .thinking
         .as_ref()
@@ -492,6 +517,8 @@ async fn handle_messages(
             log_error(
                 &state,
                 &model,
+                resolved_reasoning_effort,
+                reasoning_source.as_str(),
                 items_count,
                 &tool_names,
                 stream_mode,
@@ -511,6 +538,8 @@ async fn handle_messages(
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
             model: model.clone(),
+            reasoning_effort: resolved_reasoning_effort,
+            reasoning_source: reasoning_source.clone(),
             items: items_count,
             tools: tool_names.clone(),
             streaming: stream_mode,
@@ -530,7 +559,6 @@ async fn handle_messages(
 
     // Build ModelClient and stream.
     let conversation_id = ThreadId::new();
-    let model_info = proxy_model_info(&model);
     let client = ModelClient::new(
         Some(state.auth_manager.clone()),
         conversation_id,
@@ -553,7 +581,15 @@ async fn handle_messages(
         Err(e) => {
             let msg = format!("Stream error: {e}");
             log_error_complete(
-                &state, &model, items_count, &tool_names, stream_mode, msg.clone(), 503,
+                &state,
+                &model,
+                resolved_reasoning_effort,
+                reasoning_source.as_str(),
+                items_count,
+                &tool_names,
+                stream_mode,
+                msg.clone(),
+                503,
             )
             .await;
             return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
@@ -565,6 +601,8 @@ async fn handle_messages(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
         let log_buffer = state.log_buffer.clone();
         let model_clone = model.clone();
+        let reasoning_effort_clone = resolved_reasoning_effort;
+        let reasoning_source_clone = reasoning_source.clone();
 
         tokio::spawn(async move {
             let mut translator = StreamTranslator::new(model_clone.clone());
@@ -589,6 +627,8 @@ async fn handle_messages(
                 let entry = HttpLogEntry {
                     timestamp: Utc::now(),
                     model: model_clone.clone(),
+                    reasoning_effort: reasoning_effort_clone,
+                    reasoning_source: reasoning_source_clone.clone(),
                     items: 0,
                     tools: Vec::new(),
                     streaming: true,
@@ -629,7 +669,15 @@ async fn handle_messages(
                 Err(e) => {
                     let msg = format!("Stream error: {e}");
                     log_error_complete(
-                        &state, &model, items_count, &tool_names, false, msg.clone(), 502,
+                        &state,
+                        &model,
+                        resolved_reasoning_effort,
+                        reasoning_source.as_str(),
+                        items_count,
+                        &tool_names,
+                        false,
+                        msg.clone(),
+                        502,
                     )
                     .await;
                     return (StatusCode::BAD_GATEWAY, msg).into_response();
@@ -641,6 +689,8 @@ async fn handle_messages(
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
             model: model.clone(),
+            reasoning_effort: resolved_reasoning_effort,
+            reasoning_source: reasoning_source.clone(),
             items: items_count,
             tools: tool_names,
             streaming: false,
@@ -670,6 +720,8 @@ async fn handle_messages(
 async fn log_error(
     state: &HttpServerState,
     model: &str,
+    reasoning_effort: ReasoningEffortConfig,
+    reasoning_source: &str,
     items: usize,
     tools: &[String],
     streaming: bool,
@@ -679,6 +731,8 @@ async fn log_error(
     let entry = HttpLogEntry {
         timestamp: Utc::now(),
         model: model.to_string(),
+        reasoning_effort,
+        reasoning_source: reasoning_source.to_string(),
         items,
         tools: tools.to_vec(),
         streaming,
@@ -698,6 +752,8 @@ async fn log_error(
 async fn log_error_complete(
     state: &HttpServerState,
     model: &str,
+    reasoning_effort: ReasoningEffortConfig,
+    reasoning_source: &str,
     items: usize,
     tools: &[String],
     streaming: bool,
@@ -708,6 +764,8 @@ async fn log_error_complete(
     let entry = HttpLogEntry {
         timestamp: Utc::now(),
         model: model.to_string(),
+        reasoning_effort,
+        reasoning_source: reasoning_source.to_string(),
         items,
         tools: tools.to_vec(),
         streaming,
