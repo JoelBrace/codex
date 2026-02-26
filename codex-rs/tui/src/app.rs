@@ -3800,17 +3800,18 @@ impl App {
         // into the App struct.
         let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
             Arc::new(Mutex::new(VecDeque::new()));
-        let http_server_dynamic_config =
-            Arc::new(RwLock::new(crate::http_server::HttpServerDynamicConfig {
-                model: config
+        let http_server_dynamic_config = Arc::new(RwLock::new(
+            crate::http_server::HttpServerDynamicConfig::new(
+                config
                     .model
                     .clone()
                     .unwrap_or_else(|| "gpt-5.3-codex".to_string()),
-                provider: config.model_provider.clone(),
-                reasoning_effort: config.model_reasoning_effort,
-                reasoning_summary: config.model_reasoning_summary,
-                ws_version: codex_core::ws_version_from_features(&config),
-            }));
+                config.model_provider.clone(),
+                config.model_reasoning_effort,
+                config.model_reasoning_summary,
+                codex_core::ws_version_from_features(&config),
+            ),
+        ));
 
         let mut app = Self {
             model_catalog,
@@ -4545,12 +4546,18 @@ impl App {
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort);
                 self.refresh_status_surfaces();
-                self.http_server_dynamic_config.write().await.reasoning_effort = effort;
+                self.http_server_dynamic_config
+                    .write()
+                    .await
+                    .set_reasoning_effort(effort);
             }
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_surfaces();
-                self.http_server_dynamic_config.write().await.model = model;
+                self.http_server_dynamic_config
+                    .write()
+                    .await
+                    .set_model(model);
             }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);
@@ -9252,17 +9259,18 @@ guardian_approval = true
         let session_telemetry = test_session_telemetry(&config, model.as_str());
         let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
             Arc::new(Mutex::new(VecDeque::new()));
-        let http_server_dynamic_config =
-            Arc::new(RwLock::new(crate::http_server::HttpServerDynamicConfig {
-                model: config
+        let http_server_dynamic_config = Arc::new(RwLock::new(
+            crate::http_server::HttpServerDynamicConfig::new(
+                config
                     .model
                     .clone()
                     .unwrap_or_else(|| "gpt-5.3-codex".to_string()),
-                provider: config.model_provider.clone(),
-                reasoning_effort: config.model_reasoning_effort,
-                reasoning_summary: config.model_reasoning_summary,
-                ws_version: None,
-            }));
+                config.model_provider.clone(),
+                config.model_reasoning_effort,
+                config.model_reasoning_summary,
+                None,
+            ),
+        ));
 
         App {
             model_catalog: chat_widget.model_catalog(),
@@ -9322,17 +9330,18 @@ guardian_approval = true
         let session_telemetry = test_session_telemetry(&config, model.as_str());
         let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
             Arc::new(Mutex::new(VecDeque::new()));
-        let http_server_dynamic_config =
-            Arc::new(RwLock::new(crate::http_server::HttpServerDynamicConfig {
-                model: config
+        let http_server_dynamic_config = Arc::new(RwLock::new(
+            crate::http_server::HttpServerDynamicConfig::new(
+                config
                     .model
                     .clone()
                     .unwrap_or_else(|| "gpt-5.3-codex".to_string()),
-                provider: config.model_provider.clone(),
-                reasoning_effort: config.model_reasoning_effort,
-                reasoning_summary: config.model_reasoning_summary,
-                ws_version: None,
-            }));
+                config.model_provider.clone(),
+                config.model_reasoning_effort,
+                config.model_reasoning_summary,
+                None,
+            ),
+        ));
 
         (
             App {

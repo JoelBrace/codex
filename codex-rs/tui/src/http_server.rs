@@ -132,6 +132,45 @@ pub struct HttpServerDynamicConfig {
     pub reasoning_summary: ReasoningSummaryConfig,
     /// Optional WebSocket version for the Responses API transport.
     pub ws_version: Option<ResponsesWebsocketVersion>,
+    model_info_cache: ModelInfo,
+}
+
+impl HttpServerDynamicConfig {
+    pub fn new(
+        model: String,
+        provider: ModelProviderInfo,
+        reasoning_effort: Option<ReasoningEffortConfig>,
+        reasoning_summary: ReasoningSummaryConfig,
+        ws_version: Option<ResponsesWebsocketVersion>,
+    ) -> Self {
+        let model_info_cache = proxy_model_info(&model);
+        Self {
+            model,
+            provider,
+            reasoning_effort,
+            reasoning_summary,
+            ws_version,
+            model_info_cache,
+        }
+    }
+
+    pub fn set_model(&mut self, model: String) {
+        self.model = model;
+        self.refresh_model_info_cache();
+    }
+
+    pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<ReasoningEffortConfig>) {
+        self.reasoning_effort = reasoning_effort;
+        self.refresh_model_info_cache();
+    }
+
+    pub fn model_info(&self) -> &ModelInfo {
+        &self.model_info_cache
+    }
+
+    fn refresh_model_info_cache(&mut self) {
+        self.model_info_cache = proxy_model_info(&self.model);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,10 +507,11 @@ async fn handle_messages(
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, provider, reasoning_effort, reasoning_summary, ws_version) = {
+    let (model, model_info, provider, reasoning_effort, reasoning_summary, ws_version) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
+            cfg.model_info().clone(),
             cfg.provider.clone(),
             cfg.reasoning_effort,
             cfg.reasoning_summary.clone(),
@@ -480,7 +520,6 @@ async fn handle_messages(
     };
 
     // Resolve reasoning effort for logs.
-    let model_info = proxy_model_info(&model);
     let request_budget_effort = req
         .thinking
         .as_ref()
@@ -664,7 +703,7 @@ async fn handle_messages(
         while let Some(event) = response_stream.next().await {
             match event {
                 Ok(ev) => {
-                    translator.translate(&ev);
+                    translator.consume_event(&ev);
                 }
                 Err(e) => {
                     let msg = format!("Stream error: {e}");
@@ -849,28 +888,60 @@ impl StreamTranslator {
         }
     }
 
-    /// Translate a single `ResponseEvent` into one or more Anthropic SSE chunks.
-    ///
-    /// Returns an empty string when the event produces no output.
-    fn translate(&mut self, event: &ResponseEvent) -> String {
+    /// Consume a single `ResponseEvent` and mutate accumulated state without
+    /// emitting SSE output.
+    fn consume_event(&mut self, event: &ResponseEvent) {
         match event {
-            ResponseEvent::Created => self.handle_created(),
-            ResponseEvent::OutputItemAdded(item) => self.handle_item_added(item),
-            ResponseEvent::OutputTextDelta(delta) => self.handle_text_delta(delta),
-            ResponseEvent::OutputItemDone(item) => self.handle_item_done(item),
+            ResponseEvent::Created => {
+                self.handle_created(false);
+            }
+            ResponseEvent::OutputItemAdded(item) => {
+                self.handle_item_added(item, false);
+            }
+            ResponseEvent::OutputTextDelta(delta) => {
+                self.handle_text_delta(delta, false);
+            }
+            ResponseEvent::OutputItemDone(item) => {
+                self.handle_item_done(item, false);
+            }
             ResponseEvent::Completed { token_usage, .. } => {
                 if let Some(usage) = token_usage {
                     self.input_tokens = usage.input_tokens as u32;
                     self.output_tokens = usage.output_tokens as u32;
                 }
-                self.handle_completed()
+                self.handle_completed(false);
+            }
+            // Ignore the rest.
+            _ => {}
+        }
+    }
+
+    /// Translate a single `ResponseEvent` into one or more Anthropic SSE chunks.
+    ///
+    /// Returns an empty string when the event produces no output.
+    fn translate(&mut self, event: &ResponseEvent) -> String {
+        match event {
+            ResponseEvent::Created => self.handle_created(true),
+            ResponseEvent::OutputItemAdded(item) => self.handle_item_added(item, true),
+            ResponseEvent::OutputTextDelta(delta) => self.handle_text_delta(delta, true),
+            ResponseEvent::OutputItemDone(item) => self.handle_item_done(item, true),
+            ResponseEvent::Completed { token_usage, .. } => {
+                if let Some(usage) = token_usage {
+                    self.input_tokens = usage.input_tokens as u32;
+                    self.output_tokens = usage.output_tokens as u32;
+                }
+                self.handle_completed(true)
             }
             // Ignore the rest.
             _ => String::new(),
         }
     }
 
-    fn handle_created(&mut self) -> String {
+    fn handle_created(&mut self, emit_sse: bool) -> String {
+        if !emit_sse {
+            return String::new();
+        }
+
         let message_start = serde_json::json!({
             "type": "message_start",
             "message": {
@@ -887,7 +958,7 @@ impl StreamTranslator {
         format_sse("message_start", &message_start) + &format_sse("ping", &serde_json::json!({"type": "ping"}))
     }
 
-    fn handle_item_added(&mut self, item: &ResponseItem) -> String {
+    fn handle_item_added(&mut self, item: &ResponseItem, emit_sse: bool) -> String {
         match item {
             ResponseItem::Message { .. } => {
                 // Open a text block.
@@ -895,6 +966,11 @@ impl StreamTranslator {
                 self.next_block += 1;
                 self.current_text_block = Some(idx);
                 self.blocks.push(BlockState::Text { text: String::new() });
+
+                if !emit_sse {
+                    return String::new();
+                }
+
                 let block_start = serde_json::json!({
                     "type": "content_block_start",
                     "index": idx,
@@ -913,6 +989,11 @@ impl StreamTranslator {
                     name: name.clone(),
                     input: String::new(),
                 });
+
+                if !emit_sse {
+                    return String::new();
+                }
+
                 let block_start = serde_json::json!({
                     "type": "content_block_start",
                     "index": idx,
@@ -929,7 +1010,7 @@ impl StreamTranslator {
         }
     }
 
-    fn handle_text_delta(&mut self, delta: &str) -> String {
+    fn handle_text_delta(&mut self, delta: &str, emit_sse: bool) -> String {
         let Some(idx) = self.current_text_block else {
             return String::new();
         };
@@ -937,6 +1018,11 @@ impl StreamTranslator {
         if let Some(BlockState::Text { text }) = self.blocks.get_mut(idx) {
             text.push_str(delta);
         }
+
+        if !emit_sse {
+            return String::new();
+        }
+
         let content_delta = serde_json::json!({
             "type": "content_block_delta",
             "index": idx,
@@ -945,12 +1031,17 @@ impl StreamTranslator {
         format_sse("content_block_delta", &content_delta)
     }
 
-    fn handle_item_done(&mut self, item: &ResponseItem) -> String {
+    fn handle_item_done(&mut self, item: &ResponseItem, emit_sse: bool) -> String {
         match item {
             ResponseItem::Message { .. } => {
                 let Some(idx) = self.current_text_block.take() else {
                     return String::new();
                 };
+
+                if !emit_sse {
+                    return String::new();
+                }
+
                 let stop = serde_json::json!({
                     "type": "content_block_stop",
                     "index": idx
@@ -967,6 +1058,11 @@ impl StreamTranslator {
                 if let Some(BlockState::ToolUse { input, .. }) = self.blocks.get_mut(idx) {
                     *input = arguments.clone();
                 }
+
+                if !emit_sse {
+                    return String::new();
+                }
+
                 let args_delta = serde_json::json!({
                     "type": "content_block_delta",
                     "index": idx,
@@ -983,7 +1079,11 @@ impl StreamTranslator {
         }
     }
 
-    fn handle_completed(&self) -> String {
+    fn handle_completed(&self, emit_sse: bool) -> String {
+        if !emit_sse {
+            return String::new();
+        }
+
         let stop_reason = self.stop_reason();
         let message_delta = serde_json::json!({
             "type": "message_delta",
