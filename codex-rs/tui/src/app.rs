@@ -3810,6 +3810,7 @@ impl App {
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
                 codex_core::ws_version_from_features(&config),
+                config.features.enabled(Feature::EnableRequestCompression),
             ),
         ));
 
@@ -5609,12 +5610,12 @@ impl App {
             AppEvent::SetHttpServerEnabled(enable) => {
                 if enable {
                     if self.http_server_handle.is_none() {
-                        let state = Arc::new(crate::http_server::HttpServerState {
-                            auth_manager: self.auth_manager.clone(),
-                            dynamic_config: self.http_server_dynamic_config.clone(),
-                            log_buffer: self.http_server_log_buffer.clone(),
-                            session_telemetry: self.session_telemetry.clone(),
-                        });
+                        let state = Arc::new(crate::http_server::HttpServerState::new(
+                            self.auth_manager.clone(),
+                            self.http_server_dynamic_config.clone(),
+                            self.http_server_log_buffer.clone(),
+                            self.session_telemetry.clone(),
+                        ));
                         let router = crate::http_server::build_router(state);
                         let handle = tokio::spawn(async move {
                             if let Ok(listener) =
@@ -9269,6 +9270,7 @@ guardian_approval = true
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
                 None,
+                config.features.enabled(Feature::EnableRequestCompression),
             ),
         ));
 
@@ -9340,6 +9342,7 @@ guardian_approval = true
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
                 None,
+                config.features.enabled(Feature::EnableRequestCompression),
             ),
         ));
 
