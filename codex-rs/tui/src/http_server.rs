@@ -60,6 +60,31 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Transport key and proxy client slot
+// ---------------------------------------------------------------------------
+
+/// Identifies the transport-relevant subset of configuration.
+///
+/// When any field changes, the proxy client slot is rotated and a new
+/// `ModelClient` is created with the updated settings.
+#[derive(Clone, PartialEq, Eq)]
+struct TransportKey {
+    provider_name: String,
+    ws_version: Option<ResponsesWebsocketVersion>,
+    enable_request_compression: bool,
+}
+
+/// A reusable proxy-scoped `ModelClient` with a stable `conversation_id`.
+///
+/// Keeping the client alive across requests lets the embedded
+/// `cached_websocket_session` carry open WebSocket connections between
+/// sequential turns, avoiding the per-request handshake overhead.
+struct ProxySlot {
+    client: ModelClient,
+    key: TransportKey,
+}
+
 /// Maximum number of log entries retained in memory.
 const LOG_BUFFER_MAX: usize = 500;
 
@@ -132,6 +157,8 @@ pub struct HttpServerDynamicConfig {
     pub reasoning_summary: ReasoningSummaryConfig,
     /// Optional WebSocket version for the Responses API transport.
     pub ws_version: Option<ResponsesWebsocketVersion>,
+    /// Whether to enable zstd request compression (mirrors core feature flag).
+    pub enable_request_compression: bool,
     model_info_cache: ModelInfo,
 }
 
@@ -142,6 +169,7 @@ impl HttpServerDynamicConfig {
         reasoning_effort: Option<ReasoningEffortConfig>,
         reasoning_summary: ReasoningSummaryConfig,
         ws_version: Option<ResponsesWebsocketVersion>,
+        enable_request_compression: bool,
     ) -> Self {
         let model_info_cache = proxy_model_info(&model);
         Self {
@@ -150,6 +178,7 @@ impl HttpServerDynamicConfig {
             reasoning_effort,
             reasoning_summary,
             ws_version,
+            enable_request_compression,
             model_info_cache,
         }
     }
@@ -184,6 +213,28 @@ pub struct HttpServerState {
     /// Bounded ring buffer of log entries read by the TUI overlay.
     pub log_buffer: Arc<Mutex<VecDeque<HttpLogEntry>>>,
     pub otel_manager: OtelManager,
+    /// Reusable `ModelClient` slot shared across requests for connection reuse.
+    ///
+    /// Protected by a `Mutex` so that slot rotation (config key change) is
+    /// atomic.  We never hold this lock during network I/O.
+    proxy_slot: Mutex<Option<ProxySlot>>,
+}
+
+impl HttpServerState {
+    pub fn new(
+        auth_manager: Arc<AuthManager>,
+        dynamic_config: Arc<RwLock<HttpServerDynamicConfig>>,
+        log_buffer: Arc<Mutex<VecDeque<HttpLogEntry>>>,
+        otel_manager: OtelManager,
+    ) -> Self {
+        Self {
+            auth_manager,
+            dynamic_config,
+            log_buffer,
+            otel_manager,
+            proxy_slot: Mutex::new(None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +527,135 @@ fn budget_to_effort(budget: u32) -> ReasoningEffortConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy client slot helpers
+// ---------------------------------------------------------------------------
+
+/// Build a fresh `ModelClient` suitable for the HTTP proxy path.
+fn create_proxy_client(
+    auth_manager: &Arc<AuthManager>,
+    provider: &ModelProviderInfo,
+    ws_version: Option<ResponsesWebsocketVersion>,
+    enable_request_compression: bool,
+) -> ModelClient {
+    ModelClient::new(
+        Some(auth_manager.clone()),
+        ThreadId::new(), // stable conversation_id for the slot lifetime
+        provider.clone(),
+        SessionSource::Cli,
+        None,  // model_verbosity
+        ws_version,
+        enable_request_compression,
+        false, // include_timing_metrics
+        None,  // beta_features_header
+    )
+}
+
+/// Compute a transport key from the current config snapshot.
+fn transport_key(
+    provider: &ModelProviderInfo,
+    ws_version: Option<ResponsesWebsocketVersion>,
+    enable_request_compression: bool,
+) -> TransportKey {
+    TransportKey {
+        provider_name: provider.name.clone(),
+        ws_version,
+        enable_request_compression,
+    }
+}
+
+/// Spawn a best-effort background prewarm for the given client.
+///
+/// Errors are logged and discarded so they never affect the calling request.
+fn spawn_prewarm(client: ModelClient, model_info: ModelInfo, otel_manager: OtelManager) {
+    tokio::spawn(async move {
+        let mut session = client.new_session();
+        let prompt = Prompt::default();
+        if let Err(e) = session
+            .prewarm_websocket(&prompt, &model_info, &otel_manager, None, ReasoningSummaryConfig::Auto, None)
+            .await
+        {
+            tracing::debug!("proxy prewarm failed (best-effort): {e}");
+        }
+        // Drop `session` here so the prewarmed WebSocket connection is stored
+        // back into the client's cache via `ModelClientSession::drop`.
+    });
+}
+
+/// Acquire (or create) the reusable proxy `ModelClient` slot.
+///
+/// If the transport key matches the existing slot, the existing `ModelClient`
+/// (which has a cached WebSocket connection from the previous request) is
+/// returned.  If the key changed, a new client is created, the slot is
+/// updated, and a best-effort prewarm is spawned.
+///
+/// The mutex is held only for the in-memory slot update; no network I/O is
+/// performed while holding the lock.
+async fn acquire_slot(
+    state: &HttpServerState,
+    provider: &ModelProviderInfo,
+    ws_version: Option<ResponsesWebsocketVersion>,
+    enable_request_compression: bool,
+    model_info: &ModelInfo,
+) -> ModelClient {
+    let key = transport_key(provider, ws_version, enable_request_compression);
+    let (client, is_new) = {
+        let mut guard = state.proxy_slot.lock().await;
+        if let Some(slot) = guard.as_ref() {
+            if slot.key == key {
+                (slot.client.clone(), false)
+            } else {
+                let c = create_proxy_client(&state.auth_manager, provider, ws_version, enable_request_compression);
+                *guard = Some(ProxySlot { client: c.clone(), key });
+                (c, true)
+            }
+        } else {
+            let c = create_proxy_client(&state.auth_manager, provider, ws_version, enable_request_compression);
+            *guard = Some(ProxySlot { client: c.clone(), key });
+            (c, true)
+        }
+        // `guard` is dropped here, releasing the lock before any network I/O.
+    };
+    if is_new {
+        spawn_prewarm(client.clone(), model_info.clone(), state.otel_manager.clone());
+    }
+    client
+}
+
+// ---------------------------------------------------------------------------
+// Unified reasoning effort resolver
+// ---------------------------------------------------------------------------
+
+/// Resolve the reasoning effort for both logging and the stream call.
+///
+/// Resolution order:
+/// 1. `thinking.budget_tokens` if explicitly provided.
+/// 2. Dynamic-config override.
+/// 3. Model default.
+/// 4. `Medium` fallback.
+///
+/// Returns `(stream_effort, log_effort, source)`.  `stream_effort` is `None`
+/// when falling through to the model default so the model can use its own
+/// default instead of being forced to Medium.
+fn resolve_reasoning(
+    thinking: Option<&AnthropicThinking>,
+    config_effort: Option<ReasoningEffortConfig>,
+    model_info: &ModelInfo,
+) -> (Option<ReasoningEffortConfig>, ReasoningEffortConfig, &'static str) {
+    if let Some(budget) = thinking.and_then(|t| t.budget_tokens) {
+        let e = budget_to_effort(budget);
+        (Some(e), e, "thinking")
+    } else if let Some(e) = config_effort {
+        (Some(e), e, "config")
+    } else {
+        let e = model_info
+            .default_reasoning_level
+            .unwrap_or(ReasoningEffortConfig::Medium);
+        // Pass `None` so the model uses its own default rather than forcing Medium.
+        (None, e, "model_default")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Axum handlers
 // ---------------------------------------------------------------------------
 
@@ -507,7 +687,7 @@ async fn handle_messages(
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, model_info, provider, reasoning_effort, reasoning_summary, ws_version) = {
+    let (model, model_info, provider, reasoning_effort, reasoning_summary, ws_version, enable_request_compression) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
@@ -516,35 +696,13 @@ async fn handle_messages(
             cfg.reasoning_effort,
             cfg.reasoning_summary.clone(),
             cfg.ws_version,
+            cfg.enable_request_compression,
         )
     };
 
-    // Resolve reasoning effort for logs.
-    let request_budget_effort = req
-        .thinking
-        .as_ref()
-        .and_then(|t| t.budget_tokens)
-        .map(budget_to_effort);
-    let (resolved_reasoning_effort, reasoning_source) = if let Some(effort) = request_budget_effort {
-        (effort, "thinking".to_string())
-    } else if let Some(effort) = reasoning_effort {
-        (effort, "config".to_string())
-    } else {
-        (
-            model_info
-                .default_reasoning_level
-                .unwrap_or(ReasoningEffortConfig::Medium),
-            "model_default".to_string(),
-        )
-    };
-
-    // Keep stream behavior unchanged: request thinking override (with fallback budget),
-    // then dynamic config override.
-    let effort = req
-        .thinking
-        .as_ref()
-        .map(|t| budget_to_effort(t.budget_tokens.unwrap_or(10_000)))
-        .or(reasoning_effort);
+    // Unified reasoning resolution: used for both logging and the stream call.
+    let (stream_effort, log_effort, reasoning_source) =
+        resolve_reasoning(req.thinking.as_ref(), reasoning_effort, &model_info);
 
     // Build prompt.
     let tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
@@ -556,19 +714,15 @@ async fn handle_messages(
             log_error(
                 &state,
                 &model,
-                resolved_reasoning_effort,
-                reasoning_source.as_str(),
+                log_effort,
+                reasoning_source,
                 items_count,
                 &tool_names,
                 stream_mode,
                 format!("Failed to translate request: {e}"),
             )
             .await;
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Bad request: {e}"),
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("Bad request: {e}")).into_response();
         }
     };
 
@@ -577,8 +731,8 @@ async fn handle_messages(
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
             model: model.clone(),
-            reasoning_effort: resolved_reasoning_effort,
-            reasoning_source: reasoning_source.clone(),
+            reasoning_effort: log_effort,
+            reasoning_source: reasoning_source.to_string(),
             items: items_count,
             tools: tool_names.clone(),
             streaming: stream_mode,
@@ -596,23 +750,12 @@ async fn handle_messages(
         buf.push_back(entry);
     }
 
-    // Build ModelClient and stream.
-    let conversation_id = ThreadId::new();
-    let client = ModelClient::new(
-        Some(state.auth_manager.clone()),
-        conversation_id,
-        provider,
-        SessionSource::Cli,
-        None, // model_verbosity
-        ws_version,
-        false, // enable_request_compression
-        false, // include_timing_metrics
-        None,  // beta_features_header
-    );
+    // Acquire the reusable proxy client slot (no lock held during network I/O).
+    let client = acquire_slot(&state, &provider, ws_version, enable_request_compression, &model_info).await;
     let mut session = client.new_session();
 
     let stream_result = session
-        .stream(&prompt, &model_info, &state.otel_manager, effort, reasoning_summary, None)
+        .stream(&prompt, &model_info, &state.otel_manager, stream_effort, reasoning_summary, None)
         .await;
 
     let mut response_stream = match stream_result {
@@ -622,8 +765,8 @@ async fn handle_messages(
             log_error_complete(
                 &state,
                 &model,
-                resolved_reasoning_effort,
-                reasoning_source.as_str(),
+                log_effort,
+                reasoning_source,
                 items_count,
                 &tool_names,
                 stream_mode,
@@ -636,14 +779,11 @@ async fn handle_messages(
     };
 
     if stream_mode {
-        // --- Streaming response ---
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+        // --- Streaming response: direct stream mapping, no mpsc bridge ---
         let log_buffer = state.log_buffer.clone();
         let model_clone = model.clone();
-        let reasoning_effort_clone = resolved_reasoning_effort;
-        let reasoning_source_clone = reasoning_source.clone();
 
-        tokio::spawn(async move {
+        let sse_stream = async_stream::stream! {
             let mut translator = StreamTranslator::new(model_clone.clone());
 
             while let Some(event) = response_stream.next().await {
@@ -651,7 +791,7 @@ async fn handle_messages(
                     Ok(ev) => {
                         let sse_chunk = translator.translate(&ev);
                         if !sse_chunk.is_empty() {
-                            let _ = tx.send(Ok(Bytes::from(sse_chunk))).await;
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(sse_chunk));
                         }
                     }
                     Err(e) => {
@@ -661,35 +801,33 @@ async fn handle_messages(
                 }
             }
 
-            // Emit final log entry.
-            let response_line = {
-                let entry = HttpLogEntry {
-                    timestamp: Utc::now(),
-                    model: model_clone.clone(),
-                    reasoning_effort: reasoning_effort_clone,
-                    reasoning_source: reasoning_source_clone.clone(),
-                    items: 0,
-                    tools: Vec::new(),
-                    streaming: true,
-                    status: Some(200),
-                    stop_reason: Some(translator.stop_reason()),
-                    input_tokens: translator.input_tokens(),
-                    output_tokens: translator.output_tokens(),
-                    error: None,
-                };
-                let line = entry.response_line();
+            // Emit final log entry after the stream is exhausted.
+            let entry = HttpLogEntry {
+                timestamp: Utc::now(),
+                model: model_clone,
+                reasoning_effort: log_effort,
+                reasoning_source: reasoning_source.to_string(),
+                items: 0,
+                tools: Vec::new(),
+                streaming: true,
+                status: Some(200),
+                stop_reason: Some(translator.stop_reason()),
+                input_tokens: translator.input_tokens(),
+                output_tokens: translator.output_tokens(),
+                error: None,
+            };
+            let response_line = entry.response_line();
+            {
                 let mut buf = log_buffer.lock().await;
                 if buf.len() >= LOG_BUFFER_MAX {
                     buf.pop_front();
                 }
                 buf.push_back(entry);
-                line
-            };
+            }
             tracing::info!("{}", response_line);
-        });
+        };
 
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let body = Body::from_stream(stream);
+        let body = Body::from_stream(sse_stream);
         Response::builder()
             .status(200)
             .header("content-type", "text/event-stream")
@@ -710,8 +848,8 @@ async fn handle_messages(
                     log_error_complete(
                         &state,
                         &model,
-                        resolved_reasoning_effort,
-                        reasoning_source.as_str(),
+                        log_effort,
+                        reasoning_source,
                         items_count,
                         &tool_names,
                         false,
@@ -728,8 +866,8 @@ async fn handle_messages(
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
             model: model.clone(),
-            reasoning_effort: resolved_reasoning_effort,
-            reasoning_source: reasoning_source.clone(),
+            reasoning_effort: log_effort,
+            reasoning_source: reasoning_source.to_string(),
             items: items_count,
             tools: tool_names,
             streaming: false,
@@ -760,7 +898,7 @@ async fn log_error(
     state: &HttpServerState,
     model: &str,
     reasoning_effort: ReasoningEffortConfig,
-    reasoning_source: &str,
+    reasoning_source: &'static str,
     items: usize,
     tools: &[String],
     streaming: bool,
@@ -792,7 +930,7 @@ async fn log_error_complete(
     state: &HttpServerState,
     model: &str,
     reasoning_effort: ReasoningEffortConfig,
-    reasoning_source: &str,
+    reasoning_source: &'static str,
     items: usize,
     tools: &[String],
     streaming: bool,
