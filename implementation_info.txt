@@ -1,0 +1,185 @@
+Implementation Info: Codex <-> Claude Code Integration
+=======================================================
+Generated from reverse-engineering session, 2026-03-01
+
+
+## What Codex Is
+
+Codex is a Rust-based AI coding assistant (this repo: codex-rs) that communicates with
+OpenAI's backend via the Responses API (not the Chat Completions API). It has a TUI
+(terminal UI) and an HTTP proxy server (tui/src/http_server.rs) that exposes an
+Anthropic-compatible /v1/messages endpoint so that Claude Code can use it as a backend.
+
+
+## How Codex Talks to OpenAI
+
+Codex uses a custom "Responses API" endpoint, not the standard OpenAI Chat Completions
+API. The request struct is `ResponsesApiRequest` (codex-api/src/requests/responses.rs
+and codex-api/src/common.rs) and includes:
+
+  - model              : model slug (e.g. "gpt-5.3-codex")
+  - instructions       : system prompt text
+  - input              : Vec<ResponseItem> — conversation history
+  - tools              : serialized tool definitions
+  - tool_choice        : string ("auto", "required", etc.)
+  - parallel_tool_calls: bool
+  - reasoning          : Option<Reasoning> { effort, summary }
+  - store              : bool (whether to persist the response)
+  - stream             : bool
+  - include            : Vec<String> (e.g. ["reasoning.encrypted_content"])
+  - prompt_cache_key   : Option<String> — conversation ID for sticky routing
+  - text               : Option<TextControls> { verbosity, format/output_schema }
+
+There is NO max_tokens, temperature, top_p, or stop_sequences field. The Responses API
+does not expose these controls to clients.
+
+Transport options:
+  - HTTP SSE (standard): stream_responses_api()
+  - WebSocket (v1/v2):   stream_responses_websocket() — reuses connections across turns
+                          to avoid per-request handshake overhead
+
+Compression: zstd request compression is supported when using ChatGPT auth against
+the OpenAI provider (enable_request_compression flag).
+
+
+## Codex Context Window
+
+Codex models report a context window of 272,000 tokens (seen in
+core/src/client.rs:1352 and core/src/models_manager/manager.rs:462).
+
+
+## How the HTTP Proxy Server Works (tui/src/http_server.rs)
+
+The proxy server starts on port 8082 when the user enables it via `/http-server on`
+in the TUI. It exposes:
+
+  GET  /health        — liveness probe
+  GET  /v1/models     — returns currently selected model
+  POST /v1/messages   — Anthropic-format messages endpoint
+
+Request flow:
+  1. Receive Anthropic /v1/messages JSON body (AnthropicRequest)
+  2. Translate to internal Prompt type via translate_request()
+  3. Build ResponsesApiRequest via ModelClientSession
+  4. Stream from OpenAI Responses API backend
+  5. Translate ResponseEvents back to Anthropic SSE format (StreamTranslator)
+  6. Return SSE stream or JSON response to Claude Code
+
+Dynamic config (model, reasoning effort, provider info, ws_version) is updated from
+the TUI when the user changes settings. A reusable ModelClient (ProxySlot) is kept
+alive across requests for WebSocket connection reuse.
+
+Key translation details:
+  - Anthropic "system" → Prompt.base_instructions
+  - Anthropic "messages" → Vec<ResponseItem>
+  - Anthropic "tools" → Prompt.tools (function tool specs)
+  - Anthropic "thinking.budget_tokens" → ReasoningEffort level
+  - tool_choice is hardcoded to "auto" (not forwarded from request)
+  - max_tokens is parsed but discarded (no equivalent in Responses API)
+  - parallel_tool_calls is hardcoded to true
+
+Parameters Codex cannot forward to OpenAI (no equivalent field):
+  - max_tokens
+  - temperature
+  - top_p / top_k
+  - stop_sequences
+  - cache_control (Anthropic-specific)
+  - metadata
+  - service_tier
+
+
+## StreamTranslator: SSE Event Mapping
+
+ResponseEvent (OpenAI) → Anthropic SSE events:
+
+  ResponseEvent::Created              → message_start + ping
+  ResponseEvent::OutputItemAdded      → content_block_start
+  ResponseEvent::OutputTextDelta      → content_block_delta (text_delta)
+  ResponseEvent::OutputItemDone       → content_block_stop (+ input_json_delta for tools)
+  ResponseEvent::Completed            → message_delta + message_stop
+  (all others ignored)
+
+Token counts (input_tokens, output_tokens) only arrive in ResponseEvent::Completed,
+which fires at the END of the stream. The Anthropic protocol expects input_tokens in
+message_start (emitted at the BEGINNING). This caused input_tokens to always be 0
+in the proxy's streaming responses.
+
+Fix applied: input_tokens is now also included in the message_delta usage object.
+Claude Code's message_delta handler explicitly checks for input_tokens and updates
+its internal usage state when present — confirmed via binary inspection:
+  "message_delta": $.usage.input_tokens != null → A.usage.input_tokens = $.usage.input_tokens
+
+This means Claude Code now receives the correct input_tokens at the end of each
+streaming response and can accurately track context usage without any buffering or
+TTFB impact.
+
+
+## How Claude Code Works (Anthropic CLI, v2.1.63)
+
+Claude Code is a compiled Node.js binary at:
+  ~/.local/share/claude/versions/2.1.63
+
+It calls the Anthropic /v1/messages API and uses the following beta headers
+(selected based on model and feature flags):
+
+  claude-code-20250219           — base Claude Code beta
+  interleaved-thinking-2025-05-14
+  context-1m-2025-08-07          — 1M context window (when supported)
+  context-management-2025-06-27
+  structured-outputs-2025-12-15
+  web-search-2025-03-05          (Vertex/Foundry only)
+  tool-examples-2025-10-29
+  advanced-tool-use-2025-11-20   (or tool-search-tool-2025-10-19)
+  effort-2025-11-24
+  adaptive-thinking-2026-01-28
+  prompt-caching-scope-2026-01-05
+  fast-mode-2026-02-01
+
+Parameters Claude Code sends to /v1/messages:
+  - model
+  - messages
+  - system (with cache_control: {type: "ephemeral"} blocks for prompt caching)
+  - tools
+  - max_tokens (required by Anthropic API; always sent)
+  - thinking (extended thinking config with budget_tokens)
+  - temperature (default 1.0; overridden to 0 for deterministic tool calls)
+  - stream: true (nearly always)
+  - cache_control on content blocks (uses prompt-caching-scope beta)
+
+Claude Code does NOT send: stop_sequences
+
+
+## Claude Code Context Window Calculation
+
+Claude Code assumes a default context window of 200,000 tokens (C40 = 200000).
+It computes usage as:
+  used% = Math.min(100, Math.max(0, Math.round(input_tokens / context_window * 100)))
+
+Where input_tokens = response.usage.input_tokens
+                   + response.usage.cache_creation_input_tokens
+                   + response.usage.cache_read_input_tokens
+
+Since the proxy doesn't send cache_* fields, only input_tokens matters.
+
+The codex model context window (272,000) is larger than Claude Code's assumed window
+(200,000), so usage percentages will be slightly overstated (e.g. a 272k token
+conversation shows as 100% rather than ~74%). The value is clamped to 100 and never
+goes negative or exceeds 100%.
+
+Claude Code uses context usage to trigger auto-compact. With input_tokens always 0,
+auto-compact never triggered. With the fix, it will trigger (slightly early due to
+the window size mismatch, but far better than never).
+
+
+## Key File Locations in Codex
+
+  tui/src/http_server.rs               — Anthropic-compatible proxy server
+  core/src/client.rs                   — ModelClient / ModelClientSession, stream methods
+  core/src/client_common.rs            — Prompt struct, ToolSpec types
+  codex-api/src/common.rs              — ResponsesApiRequest, ResponseEvent, TokenUsage
+  codex-api/src/requests/responses.rs  — attach_item_ids, Compression enum
+  codex-api/src/endpoint/responses.rs  — HTTP SSE transport
+  codex-api/src/endpoint/responses_websocket.rs — WebSocket transport
+  core/src/models_manager/manager.rs   — Model metadata including context_window=272000
+  core/src/config/types.rs             — ReasoningEffort, ReasoningSummary config types
+  codex-protocol/src/protocol.rs       — TokenUsage struct (input/output/cached/reasoning)
