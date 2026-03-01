@@ -7309,6 +7309,10 @@ impl ChatWidget {
     }
 
     /// Set the model in the widget's config copy and stored collaboration mode.
+    pub(crate) fn try_get_model_info(&self, model: &str) -> Option<codex_protocol::openai_models::ModelInfo> {
+        self.models_manager.try_get_model_info(model)
+    }
+
     pub(crate) fn set_model(&mut self, model: &str) {
         self.current_collaboration_mode =
             self.current_collaboration_mode

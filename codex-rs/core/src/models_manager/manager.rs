@@ -132,6 +132,23 @@ impl ModelsManager {
         Ok(self.build_available_models(remote_models))
     }
 
+    /// Look up model metadata from the cached remote models without blocking.
+    ///
+    /// Returns `None` if the cache lock is contended. Falls back to the bundled
+    /// fallback metadata when no remote entry matches the slug.
+    pub fn try_get_model_info(&self, model: &str) -> Option<ModelInfo> {
+        let remote_models = self.try_get_remote_models().ok()?;
+        let info = Self::find_model_by_longest_prefix(model, &remote_models)
+            .or_else(|| Self::find_model_by_namespaced_suffix(model, &remote_models))
+            .map(|remote| ModelInfo {
+                slug: model.to_string(),
+                used_fallback_model_metadata: false,
+                ..remote
+            })
+            .unwrap_or_else(|| model_info::model_info_from_slug(model));
+        Some(info)
+    }
+
     // todo(aibrahim): should be visible to core only and sent on session_configured event
     /// Get the model identifier to use, refreshing according to the specified strategy.
     ///

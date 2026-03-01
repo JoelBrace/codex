@@ -88,6 +88,10 @@ struct ProxySlot {
 /// Maximum number of log entries retained in memory.
 const LOG_BUFFER_MAX: usize = 500;
 
+/// Claude Code assumes this context window size (tokens) when computing usage percentage.
+/// It is hardcoded in the Claude Code binary by model slug and cannot be overridden via API.
+const CLAUDE_CODE_ASSUMED_CONTEXT_WINDOW: f64 = 200_000.0;
+
 // ---------------------------------------------------------------------------
 // Log entry
 // ---------------------------------------------------------------------------
@@ -186,6 +190,13 @@ impl HttpServerDynamicConfig {
     pub fn set_model(&mut self, model: String) {
         self.model = model;
         self.refresh_model_info_cache();
+    }
+
+    /// Like `set_model` but uses real `ModelInfo` from the live models cache
+    /// instead of the static proxy stub.
+    pub fn set_model_with_info(&mut self, model: String, model_info: ModelInfo) {
+        self.model = model;
+        self.model_info_cache = model_info;
     }
 
     pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<ReasoningEffortConfig>) {
@@ -502,7 +513,7 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
         apply_patch_tool_type: None,
         truncation_policy: TruncationPolicyConfig::bytes(100_000),
         supports_parallel_tool_calls: true,
-        context_window: Some(200_000),
+        context_window: None,
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -750,6 +761,13 @@ async fn handle_messages(
         buf.push_back(entry);
     }
 
+    // Compute scale factor to normalise codex's effective context window to Claude Code's assumed 200k.
+    let context_window_scale = {
+        let codex_window = model_info.context_window.unwrap_or(272_000) as f64;
+        let effective = model_info.effective_context_window_percent as f64 / 100.0;
+        CLAUDE_CODE_ASSUMED_CONTEXT_WINDOW / (codex_window * effective)
+    };
+
     // Acquire the reusable proxy client slot (no lock held during network I/O).
     let client = acquire_slot(&state, &provider, ws_version, enable_request_compression, &model_info).await;
     let mut session = client.new_session();
@@ -784,7 +802,7 @@ async fn handle_messages(
         let model_clone = model.clone();
 
         let sse_stream = async_stream::stream! {
-            let mut translator = StreamTranslator::new(model_clone.clone());
+            let mut translator = StreamTranslator::new(model_clone.clone(), context_window_scale);
 
             while let Some(event) = response_stream.next().await {
                 match event {
@@ -837,7 +855,7 @@ async fn handle_messages(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     } else {
         // --- Non-streaming: accumulate and return JSON ---
-        let mut translator = StreamTranslator::new(model.clone());
+        let mut translator = StreamTranslator::new(model.clone(), context_window_scale);
         while let Some(event) = response_stream.next().await {
             match event {
                 Ok(ev) => {
@@ -979,6 +997,9 @@ struct StreamTranslator {
     output_tokens: u32,
     /// Accumulated content for non-streaming path.
     blocks: Vec<BlockState>,
+    /// Scale factor applied to input_tokens before reporting to Claude Code.
+    /// Normalises codex's effective context window to Claude Code's assumed 200k window.
+    context_window_scale: f64,
 }
 
 #[derive(Debug)]
@@ -988,7 +1009,7 @@ enum BlockState {
 }
 
 impl StreamTranslator {
-    fn new(model_slug: String) -> Self {
+    fn new(model_slug: String, context_window_scale: f64) -> Self {
         Self {
             model_slug,
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
@@ -999,6 +1020,7 @@ impl StreamTranslator {
             input_tokens: 0,
             output_tokens: 0,
             blocks: Vec::new(),
+            context_window_scale,
         }
     }
 
@@ -1222,11 +1244,12 @@ impl StreamTranslator {
             return String::new();
         }
 
+        let reported_input_tokens = (self.input_tokens as f64 * self.context_window_scale).round() as u32;
         let stop_reason = self.stop_reason();
         let message_delta = serde_json::json!({
             "type": "message_delta",
             "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-            "usage": { "output_tokens": self.output_tokens, "input_tokens": self.input_tokens }
+            "usage": { "output_tokens": self.output_tokens, "input_tokens": reported_input_tokens }
         });
         let message_stop = serde_json::json!({ "type": "message_stop" });
         format_sse("message_delta", &message_delta) + &format_sse("message_stop", &message_stop)
@@ -1252,6 +1275,7 @@ impl StreamTranslator {
                 }
             }
         }
+        let reported_input_tokens = (self.input_tokens as f64 * self.context_window_scale).round() as u32;
         serde_json::json!({
             "id": self.message_id,
             "type": "message",
@@ -1261,7 +1285,7 @@ impl StreamTranslator {
             "stop_reason": self.stop_reason(),
             "stop_sequence": null,
             "usage": {
-                "input_tokens": self.input_tokens,
+                "input_tokens": reported_input_tokens,
                 "output_tokens": self.output_tokens
             }
         })

@@ -2290,10 +2290,12 @@ impl App {
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
-                self.http_server_dynamic_config
-                    .write()
-                    .await
-                    .set_model(model);
+                let mut cfg = self.http_server_dynamic_config.write().await;
+                if let Some(model_info) = self.chat_widget.try_get_model_info(&model) {
+                    cfg.set_model_with_info(model, model_info);
+                } else {
+                    cfg.set_model(model);
+                }
             }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);
