@@ -1226,7 +1226,7 @@ impl StreamTranslator {
         let message_delta = serde_json::json!({
             "type": "message_delta",
             "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-            "usage": { "output_tokens": self.output_tokens }
+            "usage": { "output_tokens": self.output_tokens, "input_tokens": self.input_tokens }
         });
         let message_stop = serde_json::json!({ "type": "message_stop" });
         format_sse("message_delta", &message_delta) + &format_sse("message_stop", &message_stop)
