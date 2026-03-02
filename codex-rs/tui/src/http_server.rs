@@ -171,7 +171,7 @@ impl HttpServerDynamicConfig {
         model: String,
         provider: ModelProviderInfo,
         reasoning_effort: Option<ReasoningEffortConfig>,
-        reasoning_summary: ReasoningSummaryConfig,
+        reasoning_summary: Option<ReasoningSummaryConfig>,
         ws_version: Option<ResponsesWebsocketVersion>,
         enable_request_compression: bool,
     ) -> Self {
@@ -180,7 +180,7 @@ impl HttpServerDynamicConfig {
             model,
             provider,
             reasoning_effort,
-            reasoning_summary,
+            reasoning_summary: reasoning_summary.unwrap_or(ReasoningSummaryConfig::Auto),
             ws_version,
             enable_request_compression,
             model_info_cache,
@@ -263,8 +263,6 @@ struct AnthropicRequest {
     tools: Vec<AnthropicTool>,
     #[serde(default)]
     stream: bool,
-    #[serde(default)]
-    thinking: Option<AnthropicThinking>,
     #[allow(dead_code)]
     #[serde(default)]
     max_tokens: Option<u32>,
@@ -327,14 +325,6 @@ struct AnthropicTool {
     #[serde(default)]
     description: String,
     input_schema: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicThinking {
-    #[serde(rename = "type")]
-    _type: String,
-    #[serde(default)]
-    budget_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -507,7 +497,9 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
         upgrade: None,
         base_instructions: String::new(),
         model_messages: None,
+        availability_nux: None,
         supports_reasoning_summaries: true,
+        default_reasoning_summary: ReasoningSummaryConfig::Auto,
         support_verbosity: true,
         default_verbosity: None,
         apply_patch_tool_type: None,
@@ -526,16 +518,6 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
 // ---------------------------------------------------------------------------
 // Reasoning effort helpers
 // ---------------------------------------------------------------------------
-
-fn budget_to_effort(budget: u32) -> ReasoningEffortConfig {
-    if budget <= 2000 {
-        ReasoningEffortConfig::Low
-    } else if budget <= 8000 {
-        ReasoningEffortConfig::Medium
-    } else {
-        ReasoningEffortConfig::High
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Proxy client slot helpers
@@ -636,25 +618,37 @@ async fn acquire_slot(
 // Unified reasoning effort resolver
 // ---------------------------------------------------------------------------
 
+/// Map the Anthropic model name requested by the client to a reasoning effort
+/// override based on model tier. Returns `Some(Low)` for haiku requests so
+/// they always run with minimal reasoning, regardless of the TUI config.
+fn effort_for_model_tier(requested_model: &str) -> Option<ReasoningEffortConfig> {
+    let model = requested_model.to_ascii_lowercase();
+    if model.contains("haiku") {
+        Some(ReasoningEffortConfig::Low)
+    } else if model.contains("opus") {
+        Some(ReasoningEffortConfig::High)
+    } else {
+        None
+    }
+}
+
 /// Resolve the reasoning effort for both logging and the stream call.
 ///
 /// Resolution order:
-/// 1. `thinking.budget_tokens` if explicitly provided.
-/// 2. Dynamic-config override.
+/// 1. Model-tier override (haiku → Low).
+/// 2. TUI config.
 /// 3. Model default.
-/// 4. `Medium` fallback.
 ///
 /// Returns `(stream_effort, log_effort, source)`.  `stream_effort` is `None`
 /// when falling through to the model default so the model can use its own
 /// default instead of being forced to Medium.
 fn resolve_reasoning(
-    thinking: Option<&AnthropicThinking>,
+    requested_model: &str,
     config_effort: Option<ReasoningEffortConfig>,
     model_info: &ModelInfo,
 ) -> (Option<ReasoningEffortConfig>, ReasoningEffortConfig, &'static str) {
-    if let Some(budget) = thinking.and_then(|t| t.budget_tokens) {
-        let e = budget_to_effort(budget);
-        (Some(e), e, "thinking")
+    if let Some(e) = effort_for_model_tier(requested_model) {
+        (Some(e), e, "model_tier")
     } else if let Some(e) = config_effort {
         (Some(e), e, "config")
     } else {
@@ -713,7 +707,7 @@ async fn handle_messages(
 
     // Unified reasoning resolution: used for both logging and the stream call.
     let (stream_effort, log_effort, reasoning_source) =
-        resolve_reasoning(req.thinking.as_ref(), reasoning_effort, &model_info);
+        resolve_reasoning(&req.model, reasoning_effort, &model_info);
 
     // Build prompt.
     let tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
@@ -825,6 +819,7 @@ async fn handle_messages(
                 model: model_clone,
                 reasoning_effort: log_effort,
                 reasoning_source: reasoning_source.to_string(),
+
                 items: 0,
                 tools: Vec::new(),
                 streaming: true,

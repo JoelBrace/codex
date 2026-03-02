@@ -43,6 +43,7 @@ const KEY_END: KeyBinding = key_hint::plain(KeyCode::End);
 const KEY_SPACE: KeyBinding = key_hint::plain(KeyCode::Char(' '));
 const KEY_ESC: KeyBinding = key_hint::plain(KeyCode::Esc);
 const KEY_Q: KeyBinding = key_hint::plain(KeyCode::Char('q'));
+const KEY_C: KeyBinding = key_hint::plain(KeyCode::Char('c'));
 
 /// Scrollable overlay that live-reads from the shared HTTP log buffer.
 pub(crate) struct LogsOverlay {
@@ -87,19 +88,6 @@ impl LogsOverlay {
             }
         }
         lines
-    }
-
-    fn content_height(entries: &VecDeque<HttpLogEntry>) -> usize {
-        entries
-            .iter()
-            .map(|entry| {
-                if entry.status.is_some() || entry.error.is_some() {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum()
     }
 
     fn max_scroll_for_area(content_height: usize, area: Rect) -> usize {
@@ -198,6 +186,8 @@ impl LogsOverlay {
             " ".into(),
             Span::from("↑↓").dim(),
             " to scroll   ".dim(),
+            Span::from("c").dim(),
+            " to clear   ".dim(),
             Span::from("q/Esc").dim(),
             " to close".dim(),
         ]);
@@ -210,6 +200,12 @@ impl LogsOverlay {
                 let max_scroll = self.last_max_scroll;
                 if KEY_ESC.is_press(key_event) || KEY_Q.is_press(key_event) {
                     self.is_done = true;
+                } else if KEY_C.is_press(key_event) {
+                    if let Ok(mut buf) = self.log_buffer.try_lock() {
+                        buf.clear();
+                    }
+                    self.scroll_offset = 0;
+                    self.follow_bottom = true;
                 } else if KEY_UP.is_press(key_event) || KEY_K.is_press(key_event) {
                     self.follow_bottom = false;
                     self.scroll_offset = self.effective_scroll_offset(max_scroll).saturating_sub(1);
