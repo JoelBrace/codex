@@ -5332,7 +5332,7 @@ mod tests {
                 config.model_provider.clone(),
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
-                None,
+                codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
             ),
         ));
@@ -5409,7 +5409,7 @@ mod tests {
                 config.model_provider.clone(),
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
-                None,
+                codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
             ),
         ));

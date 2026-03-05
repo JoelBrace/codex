@@ -37,7 +37,6 @@ use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ResponsesWebsocketVersion;
 use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -52,6 +51,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::openai_models::TruncationPolicyConfig;
+use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::protocol::SessionSource;
 use serde::Deserialize;
@@ -72,7 +72,7 @@ use uuid::Uuid;
 #[derive(Clone, PartialEq, Eq)]
 struct TransportKey {
     provider_name: String,
-    ws_version: Option<ResponsesWebsocketVersion>,
+    ws_enabled: bool,
     enable_request_compression: bool,
 }
 
@@ -160,8 +160,8 @@ pub struct HttpServerDynamicConfig {
     pub reasoning_effort: Option<ReasoningEffortConfig>,
     /// Reasoning summary mode.
     pub reasoning_summary: ReasoningSummaryConfig,
-    /// Optional WebSocket version for the Responses API transport.
-    pub ws_version: Option<ResponsesWebsocketVersion>,
+    /// Whether WebSocket transport is enabled for the Responses API.
+    pub ws_enabled: bool,
     /// Whether to enable zstd request compression (mirrors core feature flag).
     pub enable_request_compression: bool,
     model_info_cache: ModelInfo,
@@ -173,7 +173,7 @@ impl HttpServerDynamicConfig {
         provider: ModelProviderInfo,
         reasoning_effort: Option<ReasoningEffortConfig>,
         reasoning_summary: Option<ReasoningSummaryConfig>,
-        ws_version: Option<ResponsesWebsocketVersion>,
+        ws_enabled: bool,
         enable_request_compression: bool,
     ) -> Self {
         let model_info_cache = proxy_model_info(&model);
@@ -182,7 +182,7 @@ impl HttpServerDynamicConfig {
             provider,
             reasoning_effort,
             reasoning_summary: reasoning_summary.unwrap_or(ReasoningSummaryConfig::Auto),
-            ws_version,
+            ws_enabled,
             enable_request_compression,
             model_info_cache,
         }
@@ -526,6 +526,7 @@ fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseItem> {
                                                     Some(
                                                         FunctionCallOutputContentItem::InputImage {
                                                             image_url: source.to_image_url(),
+                                                            detail: None,
                                                         },
                                                     )
                                                 }
@@ -598,6 +599,8 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
         input_modalities: default_input_modalities(),
         prefer_websockets: false,
         used_fallback_model_metadata: true,
+        supports_image_detail_original: false,
+        web_search_tool_type: WebSearchToolType::Text,
     }
 }
 
@@ -613,7 +616,7 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
 fn create_proxy_client(
     auth_manager: &Arc<AuthManager>,
     provider: &ModelProviderInfo,
-    ws_version: Option<ResponsesWebsocketVersion>,
+    ws_enabled: bool,
     enable_request_compression: bool,
 ) -> ModelClient {
     ModelClient::new(
@@ -622,7 +625,7 @@ fn create_proxy_client(
         provider.clone(),
         SessionSource::Cli,
         None,  // model_verbosity
-        ws_version,
+        ws_enabled,
         enable_request_compression,
         false, // include_timing_metrics
         None,  // beta_features_header
@@ -632,12 +635,12 @@ fn create_proxy_client(
 /// Compute a transport key from the current config snapshot.
 fn transport_key(
     provider: &ModelProviderInfo,
-    ws_version: Option<ResponsesWebsocketVersion>,
+    ws_enabled: bool,
     enable_request_compression: bool,
 ) -> TransportKey {
     TransportKey {
         provider_name: provider.name.clone(),
-        ws_version,
+        ws_enabled,
         enable_request_compression,
     }
 }
@@ -650,7 +653,7 @@ fn spawn_prewarm(client: ModelClient, model_info: ModelInfo, otel_manager: OtelM
         let mut session = client.new_session();
         let prompt = Prompt::default();
         if let Err(e) = session
-            .prewarm_websocket(&prompt, &model_info, &otel_manager, None, ReasoningSummaryConfig::Auto, None)
+            .prewarm_websocket(&prompt, &model_info, &otel_manager, None, ReasoningSummaryConfig::Auto, None, None)
             .await
         {
             tracing::debug!("proxy prewarm failed (best-effort): {e}");
@@ -672,23 +675,23 @@ fn spawn_prewarm(client: ModelClient, model_info: ModelInfo, otel_manager: OtelM
 async fn acquire_slot(
     state: &HttpServerState,
     provider: &ModelProviderInfo,
-    ws_version: Option<ResponsesWebsocketVersion>,
+    ws_enabled: bool,
     enable_request_compression: bool,
     model_info: &ModelInfo,
 ) -> ModelClient {
-    let key = transport_key(provider, ws_version, enable_request_compression);
+    let key = transport_key(provider, ws_enabled, enable_request_compression);
     let (client, is_new) = {
         let mut guard = state.proxy_slot.lock().await;
         if let Some(slot) = guard.as_ref() {
             if slot.key == key {
                 (slot.client.clone(), false)
             } else {
-                let c = create_proxy_client(&state.auth_manager, provider, ws_version, enable_request_compression);
+                let c = create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression);
                 *guard = Some(ProxySlot { client: c.clone(), key });
                 (c, true)
             }
         } else {
-            let c = create_proxy_client(&state.auth_manager, provider, ws_version, enable_request_compression);
+            let c = create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression);
             *guard = Some(ProxySlot { client: c.clone(), key });
             (c, true)
         }
@@ -778,7 +781,7 @@ async fn handle_messages(
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, model_info, provider, reasoning_effort, reasoning_summary, ws_version, enable_request_compression) = {
+    let (model, model_info, provider, reasoning_effort, reasoning_summary, ws_enabled, enable_request_compression) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
@@ -786,7 +789,7 @@ async fn handle_messages(
             cfg.provider.clone(),
             cfg.reasoning_effort,
             cfg.reasoning_summary.clone(),
-            cfg.ws_version,
+            cfg.ws_enabled,
             cfg.enable_request_compression,
         )
     };
@@ -849,11 +852,11 @@ async fn handle_messages(
     };
 
     // Acquire the reusable proxy client slot (no lock held during network I/O).
-    let client = acquire_slot(&state, &provider, ws_version, enable_request_compression, &model_info).await;
+    let client = acquire_slot(&state, &provider, ws_enabled, enable_request_compression, &model_info).await;
     let mut session = client.new_session();
 
     let stream_result = session
-        .stream(&prompt, &model_info, &state.otel_manager, stream_effort, reasoning_summary, None)
+        .stream(&prompt, &model_info, &state.otel_manager, stream_effort, reasoning_summary, None, None)
         .await;
 
     let mut response_stream = match stream_result {

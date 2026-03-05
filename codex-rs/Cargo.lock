@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "codex-artifacts"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "codex-package-manager",
  "pretty_assertions",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "codex-package-manager"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "fd-lock",
  "flate2",
