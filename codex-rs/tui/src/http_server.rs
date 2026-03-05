@@ -44,6 +44,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -283,6 +284,29 @@ enum AnthropicContent {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Url {
+        url: String,
+    },
+}
+
+impl AnthropicImageSource {
+    fn to_image_url(&self) -> String {
+        match self {
+            Self::Base64 { media_type, data } => {
+                format!("data:{media_type};base64,{data}")
+            }
+            Self::Url { url } => url.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicBlock {
     Text {
         text: String,
@@ -301,6 +325,24 @@ enum AnthropicBlock {
         #[allow(dead_code)]
         thinking: String,
     },
+    Image {
+        source: AnthropicImageSource,
+    },
+    Document {
+        #[serde(default)]
+        title: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicToolResultBlock {
+    Text { text: String },
+    Image { source: AnthropicImageSource },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -309,14 +351,7 @@ enum AnthropicToolResultContent {
     #[default]
     Empty,
     Text(String),
-    Blocks(Vec<AnthropicTextBlock>),
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicTextBlock {
-    #[serde(rename = "type")]
-    _type: String,
-    text: String,
+    Blocks(Vec<AnthropicToolResultBlock>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,6 +432,26 @@ fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseItem> {
                         AnthropicBlock::Thinking { .. } => {
                             // Skip thinking blocks from history.
                         }
+                        AnthropicBlock::Image { source } => {
+                            let item = ContentItem::InputImage {
+                                image_url: source.to_image_url(),
+                            };
+                            text_content.push(item);
+                        }
+                        AnthropicBlock::Document { title } => {
+                            let label = title.as_deref().unwrap_or("untitled");
+                            let placeholder =
+                                format!("[Document: {label} — not supported by this proxy]");
+                            let item = if msg.role == "user" {
+                                ContentItem::InputText { text: placeholder }
+                            } else {
+                                ContentItem::OutputText { text: placeholder }
+                            };
+                            text_content.push(item);
+                        }
+                        AnthropicBlock::Unknown => {
+                            // Silently skip unrecognised block types.
+                        }
                         AnthropicBlock::Text { text } => {
                             let item = if msg.role == "user" {
                                 ContentItem::InputText { text: text.clone() }
@@ -438,22 +493,53 @@ fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseItem> {
                                     phase: None,
                                 });
                             }
-                            let output_text = match content {
-                                AnthropicToolResultContent::Empty => String::new(),
-                                AnthropicToolResultContent::Text(t) => t.clone(),
-                                AnthropicToolResultContent::Blocks(blocks) => blocks
-                                    .iter()
-                                    .map(|b| b.text.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            };
-                            items.push(ResponseItem::FunctionCallOutput {
-                                call_id: tool_use_id.clone(),
-                                output: FunctionCallOutputPayload {
-                                    body: FunctionCallOutputBody::Text(output_text),
-                                    success: None,
-                                },
-                            });
+                            match content {
+                                AnthropicToolResultContent::Empty => {
+                                    items.push(ResponseItem::FunctionCallOutput {
+                                        call_id: tool_use_id.clone(),
+                                        output: FunctionCallOutputPayload {
+                                            body: FunctionCallOutputBody::Text(String::new()),
+                                            success: None,
+                                        },
+                                    });
+                                }
+                                AnthropicToolResultContent::Text(t) => {
+                                    items.push(ResponseItem::FunctionCallOutput {
+                                        call_id: tool_use_id.clone(),
+                                        output: FunctionCallOutputPayload {
+                                            body: FunctionCallOutputBody::Text(t.clone()),
+                                            success: None,
+                                        },
+                                    });
+                                }
+                                AnthropicToolResultContent::Blocks(blocks) => {
+                                    let content_items: Vec<FunctionCallOutputContentItem> =
+                                        blocks
+                                            .iter()
+                                            .filter_map(|b| match b {
+                                                AnthropicToolResultBlock::Text { text } => {
+                                                    Some(FunctionCallOutputContentItem::InputText {
+                                                        text: text.clone(),
+                                                    })
+                                                }
+                                                AnthropicToolResultBlock::Image { source } => {
+                                                    Some(
+                                                        FunctionCallOutputContentItem::InputImage {
+                                                            image_url: source.to_image_url(),
+                                                        },
+                                                    )
+                                                }
+                                                AnthropicToolResultBlock::Unknown => None,
+                                            })
+                                            .collect();
+                                    items.push(ResponseItem::FunctionCallOutput {
+                                        call_id: tool_use_id.clone(),
+                                        output: FunctionCallOutputPayload::from_content_items(
+                                            content_items,
+                                        ),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
