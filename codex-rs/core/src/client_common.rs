@@ -69,6 +69,18 @@ impl Prompt {
         Ok(())
     }
 
+    /// Enable the backend's built-in web search tool for this prompt.
+    ///
+    /// `live` = true → `WebSearchMode::Live` (fresh results)
+    /// `live` = false → `WebSearchMode::Cached`
+    pub fn add_web_search_tool(&mut self, live: bool) {
+        use self::tools::ToolSpec;
+        self.tools.push(ToolSpec::WebSearch {
+            external_web_access: Some(live),
+            search_content_types: None,
+        });
+    }
+
     /// Set whether parallel tool calls are permitted.
     pub fn set_parallel_tool_calls(&mut self, parallel: bool) {
         self.parallel_tool_calls = parallel;

@@ -356,10 +356,13 @@ enum AnthropicToolResultContent {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicTool {
+    #[serde(rename = "type", default)]
+    tool_type: String,
     name: String,
     #[serde(default)]
     description: String,
-    input_schema: Value,
+    #[serde(default)]
+    input_schema: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,11 +396,12 @@ fn translate_request(req: &AnthropicRequest, _model: &str) -> anyhow::Result<Pro
 
     // Tools
     for tool in &req.tools {
-        prompt.add_function_tool(
-            tool.name.clone(),
-            tool.description.clone(),
-            tool.input_schema.clone(),
-        )?;
+        if tool.tool_type.starts_with("web_search_") {
+            prompt.add_web_search_tool(true);
+        } else if let Some(schema) = &tool.input_schema {
+            prompt.add_function_tool(tool.name.clone(), tool.description.clone(), schema.clone())?;
+        }
+        // Other unknown built-in tool types (computer_use, etc.) are silently skipped
     }
     prompt.set_parallel_tool_calls(true);
 
