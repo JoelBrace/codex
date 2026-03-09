@@ -338,12 +338,18 @@ async fn connect_websocket(
         .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
     request.headers_mut().extend(headers);
 
-    let response = tokio_tungstenite::connect_async_with_config(
-        request,
-        Some(websocket_config()),
-        false, // `false` means "do not disable Nagle", which is tungstenite's recommended default.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio_tungstenite::connect_async_with_config(
+            request,
+            Some(websocket_config()),
+            false, // `false` means "do not disable Nagle", which is tungstenite's recommended default.
+        ),
     )
-    .await;
+    .await
+    .map_err(|_| {
+        ApiError::Stream("websocket connection timed out after 30s".into())
+    })?;
 
     let (stream, response) = match response {
         Ok((stream, response)) => {

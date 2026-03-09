@@ -62,13 +62,13 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// Transport key and proxy client slot
+// Transport key and warm pool / session cache
 // ---------------------------------------------------------------------------
 
 /// Identifies the transport-relevant subset of configuration.
 ///
-/// When any field changes, the proxy client slot is rotated and a new
-/// `ModelClient` is created with the updated settings.
+/// Used to invalidate warm-pool and session-cache entries when provider
+/// config changes.
 #[derive(Clone, PartialEq, Eq)]
 struct TransportKey {
     provider_name: String,
@@ -76,13 +76,24 @@ struct TransportKey {
     enable_request_compression: bool,
 }
 
-/// A reusable proxy-scoped `ModelClient` with a stable `conversation_id`.
+/// A pre-warmed `ModelClient` held in the warm pool.
 ///
-/// Keeping the client alive across requests lets the embedded
-/// `cached_websocket_session` carry open WebSocket connections between
-/// sequential turns, avoiding the per-request handshake overhead.
-struct ProxySlot {
+/// Each entry is a *fresh* client (never used for a real request) so it
+/// cannot carry a stale WebSocket connection.
+struct WarmPoolEntry {
     client: ModelClient,
+    key: TransportKey,
+}
+
+/// A cached `ModelClient` for an identified agent session.
+///
+/// Keyed by the `X-Codex-Session-Id` request header. Reusing the same
+/// client across tool-call turns preserves the WebSocket connection (and
+/// thus server-side sticky routing) for the duration of a single agent
+/// conversation, while keeping each agent session isolated from others.
+struct SessionCacheEntry {
+    client: ModelClient,
+    last_used: std::time::Instant,
     key: TransportKey,
 }
 
@@ -218,6 +229,12 @@ impl HttpServerDynamicConfig {
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// How many pre-warmed clients to keep in the pool.
+const WARM_POOL_TARGET: usize = 2;
+
+/// Evict session-cache entries idle for longer than this.
+const SESSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// State shared across all HTTP handler invocations.
 pub struct HttpServerState {
     pub auth_manager: Arc<AuthManager>,
@@ -225,11 +242,17 @@ pub struct HttpServerState {
     /// Bounded ring buffer of log entries read by the TUI overlay.
     pub log_buffer: Arc<Mutex<VecDeque<HttpLogEntry>>>,
     pub otel_manager: OtelManager,
-    /// Reusable `ModelClient` slot shared across requests for connection reuse.
+    /// Pool of pre-warmed `ModelClient` instances for fast cold-start.
     ///
-    /// Protected by a `Mutex` so that slot rotation (config key change) is
-    /// atomic.  We never hold this lock during network I/O.
-    proxy_slot: Mutex<Option<ProxySlot>>,
+    /// Each entry is a fresh client (never used for a real request).
+    /// The mutex is held only for the deque operation — never during I/O.
+    warm_pool: Mutex<VecDeque<WarmPoolEntry>>,
+    /// Per-agent-session `ModelClient` cache, keyed by `X-Codex-Session-Id`.
+    ///
+    /// Entries are taken out (removed) at request start and re-inserted
+    /// after the response completes, so two concurrent requests for the
+    /// same session ID never share a client.
+    session_cache: Mutex<HashMap<String, SessionCacheEntry>>,
 }
 
 impl HttpServerState {
@@ -244,7 +267,8 @@ impl HttpServerState {
             dynamic_config,
             log_buffer,
             otel_manager,
-            proxy_slot: Mutex::new(None),
+            warm_pool: Mutex::new(VecDeque::new()),
+            session_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -649,61 +673,89 @@ fn transport_key(
     }
 }
 
-/// Spawn a best-effort background prewarm for the given client.
+/// Spawn best-effort background prewarm tasks to refill the warm pool.
 ///
-/// Errors are logged and discarded so they never affect the calling request.
-fn spawn_prewarm(client: ModelClient, model_info: ModelInfo, otel_manager: OtelManager) {
+/// Creates fresh clients (never used for real requests — no stale connections
+/// possible) up to `WARM_POOL_TARGET`, prewarming each WebSocket connection
+/// before pushing it into the pool.
+fn spawn_pool_refill(
+    state: Arc<HttpServerState>,
+    key: TransportKey,
+    model_info: ModelInfo,
+) {
     tokio::spawn(async move {
-        let mut session = client.new_session();
-        let prompt = Prompt::default();
-        if let Err(e) = session
-            .prewarm_websocket(&prompt, &model_info, &otel_manager, None, ReasoningSummaryConfig::Auto, None, None)
-            .await
-        {
-            tracing::debug!("proxy prewarm failed (best-effort): {e}");
+        let current_len = state.warm_pool.lock().await.len();
+        let needed = WARM_POOL_TARGET.saturating_sub(current_len);
+        for _ in 0..needed {
+            let client = create_proxy_client(
+                &state.auth_manager,
+                &{
+                    let cfg = state.dynamic_config.read().await;
+                    cfg.provider.clone()
+                },
+                key.ws_enabled,
+                key.enable_request_compression,
+            );
+            let mut session = client.new_session();
+            let prompt = Prompt::default();
+            if let Err(e) = session
+                .prewarm_websocket(
+                    &prompt,
+                    &model_info,
+                    &state.otel_manager,
+                    None,
+                    ReasoningSummaryConfig::Auto,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::debug!("warm pool prewarm failed (best-effort): {e}");
+                // Don't push a failed prewarm; just skip this slot.
+                continue;
+            }
+            // Drop session here: the prewarmed connection is stored back into
+            // `client` via `ModelClientSession::drop`.
+            drop(session);
+            state
+                .warm_pool
+                .lock()
+                .await
+                .push_back(WarmPoolEntry { client, key: key.clone() });
         }
-        // Drop `session` here so the prewarmed WebSocket connection is stored
-        // back into the client's cache via `ModelClientSession::drop`.
     });
 }
 
-/// Acquire (or create) the reusable proxy `ModelClient` slot.
+/// Check out a pre-warmed client from the pool, or create a fresh one.
 ///
-/// If the transport key matches the existing slot, the existing `ModelClient`
-/// (which has a cached WebSocket connection from the previous request) is
-/// returned.  If the key changed, a new client is created, the slot is
-/// updated, and a best-effort prewarm is spawned.
-///
-/// The mutex is held only for the in-memory slot update; no network I/O is
-/// performed while holding the lock.
-async fn acquire_slot(
-    state: &HttpServerState,
+/// The pool mutex is held only for the deque pop — never during network I/O.
+/// After handing out a client, a background task refills the pool.
+async fn checkout_or_create_client(
+    state: &Arc<HttpServerState>,
     provider: &ModelProviderInfo,
     ws_enabled: bool,
     enable_request_compression: bool,
     model_info: &ModelInfo,
 ) -> ModelClient {
     let key = transport_key(provider, ws_enabled, enable_request_compression);
-    let (client, is_new) = {
-        let mut guard = state.proxy_slot.lock().await;
-        if let Some(slot) = guard.as_ref() {
-            if slot.key == key {
-                (slot.client.clone(), false)
-            } else {
-                let c = create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression);
-                *guard = Some(ProxySlot { client: c.clone(), key });
-                (c, true)
-            }
-        } else {
-            let c = create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression);
-            *guard = Some(ProxySlot { client: c.clone(), key });
-            (c, true)
-        }
-        // `guard` is dropped here, releasing the lock before any network I/O.
+
+    // Try to pop a matching warm entry (lock held briefly, no I/O).
+    let warm = {
+        let mut pool = state.warm_pool.lock().await;
+        let pos = pool.iter().position(|e| e.key == key);
+        pos.map(|i| pool.remove(i).unwrap())
     };
-    if is_new {
-        spawn_prewarm(client.clone(), model_info.clone(), state.otel_manager.clone());
-    }
+
+    let client = if let Some(entry) = warm {
+        entry.client
+    } else {
+        // Cold fallback: fresh client, fresh (empty) WebSocket session.
+        create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression)
+    };
+
+    // Refill pool in background so future requests are warm.
+    spawn_pool_refill(Arc::clone(state), key, model_info.clone());
+
     client
 }
 
@@ -779,6 +831,7 @@ async fn list_models(State(state): State<Arc<HttpServerState>>) -> impl IntoResp
 
 async fn handle_messages(
     State(state): State<Arc<HttpServerState>>,
+    headers: axum::http::HeaderMap,
     body: axum::extract::Json<AnthropicRequest>,
 ) -> Response {
     let req = body.0;
@@ -855,8 +908,35 @@ async fn handle_messages(
         CLAUDE_CODE_ASSUMED_CONTEXT_WINDOW / (codex_window * effective)
     };
 
-    // Acquire the reusable proxy client slot (no lock held during network I/O).
-    let client = acquire_slot(&state, &provider, ws_enabled, enable_request_compression, &model_info).await;
+    // Resolve which ModelClient to use for this request.
+    //
+    // If the caller sends `X-Codex-Session-Id`, we reuse a cached client for
+    // that session so WebSocket connections (and server-side sticky routing) are
+    // preserved across tool-call turns. Each agent session is isolated from
+    // others via its own `conversation_id`.
+    //
+    // Without the header we check out a pre-warmed client from the pool (or
+    // create a fresh one). Each such request gets its own `conversation_id`,
+    // preventing backend serialisation of unrelated concurrent requests and
+    // eliminating stale-WebSocket reuse.
+    let session_id = headers
+        .get("x-codex-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    let key = transport_key(&provider, ws_enabled, enable_request_compression);
+
+    let client = if let Some(ref sid) = session_id {
+        // Take the entry out of the cache (preventing concurrent reuse).
+        let entry = state.session_cache.lock().await.remove(sid);
+        match entry {
+            Some(e) if e.key == key => e.client,
+            _ => create_proxy_client(&state.auth_manager, &provider, ws_enabled, enable_request_compression),
+        }
+    } else {
+        checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &model_info).await
+    };
+
     let mut session = client.new_session();
 
     let stream_result = session
@@ -886,6 +966,7 @@ async fn handle_messages(
     if stream_mode {
         // --- Streaming response: direct stream mapping, no mpsc bridge ---
         let log_buffer = state.log_buffer.clone();
+        let state_for_stream = Arc::clone(&state);
         let model_clone = model.clone();
 
         let sse_stream = async_stream::stream! {
@@ -904,6 +985,24 @@ async fn handle_messages(
                         break;
                     }
                 }
+            }
+
+            // Drop the session so the WebSocket connection is stored back into
+            // `client` via `ModelClientSession::drop` before we return the
+            // client to the session cache.
+            drop(session);
+
+            // Return the client to the session cache (if this was a named session).
+            if let Some(ref sid) = session_id {
+                let mut cache = state_for_stream.session_cache.lock().await;
+                let now = std::time::Instant::now();
+                // Evict stale entries.
+                cache.retain(|_, e| now.duration_since(e.last_used) < SESSION_CACHE_TTL);
+                cache.insert(sid.clone(), SessionCacheEntry {
+                    client,
+                    last_used: now,
+                    key: key.clone(),
+                });
             }
 
             // Emit final log entry after the stream is exhausted.
@@ -966,6 +1065,23 @@ async fn handle_messages(
                     return (StatusCode::BAD_GATEWAY, msg).into_response();
                 }
             }
+        }
+
+        // Drop the session so the WebSocket connection is stored back into
+        // `client` via `ModelClientSession::drop` before we return the
+        // client to the session cache.
+        drop(session);
+
+        // Return the client to the session cache (if this was a named session).
+        if let Some(ref sid) = session_id {
+            let mut cache = state.session_cache.lock().await;
+            let now = std::time::Instant::now();
+            cache.retain(|_, e| now.duration_since(e.last_used) < SESSION_CACHE_TTL);
+            cache.insert(sid.clone(), SessionCacheEntry {
+                client,
+                last_used: now,
+                key,
+            });
         }
 
         let message = translator.build_response(&req.model);
