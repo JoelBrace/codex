@@ -1,0 +1,73 @@
+Session Source Investigation: Cli vs SubAgent for HTTP Proxy
+=============================================================
+
+## Background
+
+The HTTP proxy server in `codex-rs/tui/src/http_server.rs` creates a `ModelClient`
+per request using `SessionSource::Cli`. The question is whether this should be
+changed to `SessionSource::SubAgent(...)` since the proxy is intended to front
+external AI agents.
+
+## What SessionSource Does
+
+`SessionSource` is defined in `codex-rs/protocol/src/protocol.rs` (lines 2031-2040).
+
+It is NOT just a client-side telemetry value. When the variant is `SubAgent(...)`,
+it causes the `x-openai-subagent` HTTP header to be included in every request to
+the backend (OpenAI/chatgpt.com).
+
+Header insertion happens in two places:
+- `codex-rs/codex-api/src/endpoint/responses.rs` lines 79-81 (SSE/HTTP path)
+- `codex-rs/core/src/client.rs` lines 352-369, `build_subagent_headers()` (compact/summarize)
+
+Header value mapping (from `codex-rs/codex-api/src/requests/headers.rs` lines 13-28):
+  SubAgentSource::Review              -> "review"
+  SubAgentSource::Compact             -> "compact"
+  SubAgentSource::MemoryConsolidation -> "memory_consolidation"
+  SubAgentSource::ThreadSpawn { .. }  -> "collab_spawn"
+  SubAgentSource::Other(label)        -> the label string
+
+Non-SubAgent variants (Cli, VSCode, Exec, Mcp) send NO x-openai-subagent header.
+
+## Current State
+
+The HTTP proxy uses `SessionSource::Cli` (http_server.rs line ~654), which means:
+- No x-openai-subagent header is sent
+- Backend treats requests as if from a direct CLI human user
+
+The main Codex flow uses `SessionSource::Exec` (thread_manager.rs line 235).
+Child agents spawned via the spawn_agent tool use `SubAgent(SubAgentSource::ThreadSpawn {...})`,
+which sends `x-openai-subagent: collab_spawn`.
+
+## The Tradeoff
+
+Changing to `SubAgent(SubAgentSource::Other("http_proxy"))` would:
+
+PROS:
+- Honest signal to the backend about the nature of the traffic
+- Backend can apply appropriate resource policies for automated agent use
+- Consistent with how Codex itself identifies sub-agent traffic
+
+CONS:
+- Backend may apply STRICTER rate limiting or lower resource caps for SubAgent traffic
+  (sub-agents can multiply request volume, so the backend may throttle them more)
+- Currently `Cli` may be getting more generous limits as it looks like human traffic
+- Without knowing the backend's per-type policy, switching could make stalls worse
+
+## Recommendation
+
+Leave as `SessionSource::Cli` for now. The `SubAgent` header is the more honest
+signal, but without visibility into the backend's rate limiting policy per session
+source type, switching carries risk of worsening the latency problems.
+
+Revisit after the retry logic is implemented and stall behavior is characterised.
+At that point, a controlled A/B test (Cli vs SubAgent on the same benchmark) would
+give a clear answer.
+
+## Files to Change If Switching
+
+- `codex-rs/tui/src/http_server.rs` function `create_proxy_client` (~line 620-637)
+  Change: `SessionSource::Cli,`
+  To:     `SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Other("http_proxy".to_string())),`
+
+- May need to add import: `use codex_protocol::protocol::SubAgentSource;`

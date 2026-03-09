@@ -361,13 +361,19 @@ async fn connect_websocket(
         .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
         .map(tokio_tungstenite::Connector::Rustls);
 
-    let response = connect_async_tls_with_config(
-        request,
-        Some(websocket_config()),
-        false, // `false` means "do not disable Nagle", which is tungstenite's recommended default.
-        connector,
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        connect_async_tls_with_config(
+            request,
+            Some(websocket_config()),
+            false, // `false` means "do not disable Nagle", which is tungstenite's recommended default.
+            connector,
+        ),
     )
-    .await;
+    .await
+    .map_err(|_| {
+        ApiError::Stream("websocket connection timed out after 30s".into())
+    })?;
 
     let (stream, response) = match response {
         Ok((stream, response)) => {
