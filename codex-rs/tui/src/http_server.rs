@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -31,7 +32,6 @@ use axum::routing::get;
 use axum::routing::post;
 use chrono::DateTime;
 use chrono::Utc;
-use axum::body::Bytes;
 use codex_core::AuthManager;
 use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
@@ -686,13 +686,11 @@ fn spawn_pool_refill(
     tokio::spawn(async move {
         let current_len = state.warm_pool.lock().await.len();
         let needed = WARM_POOL_TARGET.saturating_sub(current_len);
+        let provider = state.dynamic_config.read().await.provider.clone();
         for _ in 0..needed {
             let client = create_proxy_client(
                 &state.auth_manager,
-                &{
-                    let cfg = state.dynamic_config.read().await;
-                    cfg.provider.clone()
-                },
+                &provider,
                 key.ws_enabled,
                 key.enable_request_compression,
             );
@@ -814,9 +812,10 @@ async fn health() -> &'static str {
 }
 
 async fn list_models(State(state): State<Arc<HttpServerState>>) -> impl IntoResponse {
-    let cfg = state.dynamic_config.read().await;
-    let model_id = cfg.model.clone();
-    drop(cfg);
+    let model_id = {
+        let cfg = state.dynamic_config.read().await;
+        cfg.model.clone()
+    };
     let body = serde_json::json!({
         "object": "list",
         "data": [{
@@ -871,6 +870,7 @@ async fn handle_messages(
                 &tool_names,
                 stream_mode,
                 format!("Failed to translate request: {e}"),
+                None,
             )
             .await;
             return (StatusCode::BAD_REQUEST, format!("Bad request: {e}")).into_response();
@@ -894,11 +894,7 @@ async fn handle_messages(
             error: None,
         };
         tracing::info!("{}", entry.request_line());
-        let mut buf = state.log_buffer.lock().await;
-        if buf.len() >= LOG_BUFFER_MAX {
-            buf.pop_front();
-        }
-        buf.push_back(entry);
+        append_log(&state.log_buffer, entry).await;
     }
 
     // Compute scale factor to normalise codex's effective context window to Claude Code's assumed 200k.
@@ -947,7 +943,7 @@ async fn handle_messages(
         Ok(s) => s,
         Err(e) => {
             let msg = format!("Stream error: {e}");
-            log_error_complete(
+            log_error(
                 &state,
                 &model,
                 log_effort,
@@ -956,7 +952,7 @@ async fn handle_messages(
                 &tool_names,
                 stream_mode,
                 msg.clone(),
-                503,
+                Some(503),
             )
             .await;
             return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
@@ -994,15 +990,7 @@ async fn handle_messages(
 
             // Return the client to the session cache (if this was a named session).
             if let Some(ref sid) = session_id {
-                let mut cache = state_for_stream.session_cache.lock().await;
-                let now = std::time::Instant::now();
-                // Evict stale entries.
-                cache.retain(|_, e| now.duration_since(e.last_used) < SESSION_CACHE_TTL);
-                cache.insert(sid.clone(), SessionCacheEntry {
-                    client,
-                    last_used: now,
-                    key: key.clone(),
-                });
+                cache_session(&state_for_stream.session_cache, sid, client, key.clone()).await;
             }
 
             // Emit final log entry after the stream is exhausted.
@@ -1016,19 +1004,13 @@ async fn handle_messages(
                 tools: Vec::new(),
                 streaming: true,
                 status: Some(200),
-                stop_reason: Some(translator.stop_reason()),
+                stop_reason: Some(translator.stop_reason().to_string()),
                 input_tokens: translator.input_tokens(),
                 output_tokens: translator.output_tokens(),
                 error: None,
             };
             let response_line = entry.response_line();
-            {
-                let mut buf = log_buffer.lock().await;
-                if buf.len() >= LOG_BUFFER_MAX {
-                    buf.pop_front();
-                }
-                buf.push_back(entry);
-            }
+            append_log(&log_buffer, entry).await;
             tracing::info!("{}", response_line);
         };
 
@@ -1050,7 +1032,7 @@ async fn handle_messages(
                 }
                 Err(e) => {
                     let msg = format!("Stream error: {e}");
-                    log_error_complete(
+                    log_error(
                         &state,
                         &model,
                         log_effort,
@@ -1059,7 +1041,7 @@ async fn handle_messages(
                         &tool_names,
                         false,
                         msg.clone(),
-                        502,
+                        Some(502),
                     )
                     .await;
                     return (StatusCode::BAD_GATEWAY, msg).into_response();
@@ -1074,14 +1056,7 @@ async fn handle_messages(
 
         // Return the client to the session cache (if this was a named session).
         if let Some(ref sid) = session_id {
-            let mut cache = state.session_cache.lock().await;
-            let now = std::time::Instant::now();
-            cache.retain(|_, e| now.duration_since(e.last_used) < SESSION_CACHE_TTL);
-            cache.insert(sid.clone(), SessionCacheEntry {
-                client,
-                last_used: now,
-                key,
-            });
+            cache_session(&state.session_cache, sid, client, key).await;
         }
 
         let message = translator.build_response(&req.model);
@@ -1094,19 +1069,13 @@ async fn handle_messages(
             tools: tool_names,
             streaming: false,
             status: Some(200),
-            stop_reason: Some(translator.stop_reason()),
+            stop_reason: Some(translator.stop_reason().to_string()),
             input_tokens: translator.input_tokens(),
             output_tokens: translator.output_tokens(),
             error: None,
         };
         tracing::info!("{}", entry.response_line());
-        {
-            let mut buf = state.log_buffer.lock().await;
-            if buf.len() >= LOG_BUFFER_MAX {
-                buf.pop_front();
-            }
-            buf.push_back(entry);
-        }
+        append_log(&state.log_buffer, entry).await;
 
         axum::Json(message).into_response()
     }
@@ -1115,6 +1084,26 @@ async fn handle_messages(
 // ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
+
+async fn append_log(buffer: &Arc<Mutex<VecDeque<HttpLogEntry>>>, entry: HttpLogEntry) {
+    let mut buf = buffer.lock().await;
+    if buf.len() >= LOG_BUFFER_MAX {
+        buf.pop_front();
+    }
+    buf.push_back(entry);
+}
+
+async fn cache_session(
+    cache: &Mutex<HashMap<String, SessionCacheEntry>>,
+    sid: &str,
+    client: ModelClient,
+    key: TransportKey,
+) {
+    let mut c = cache.lock().await;
+    let now = std::time::Instant::now();
+    c.retain(|_, e| now.duration_since(e.last_used) < SESSION_CACHE_TTL);
+    c.insert(sid.to_owned(), SessionCacheEntry { client, last_used: now, key });
+}
 
 async fn log_error(
     state: &HttpServerState,
@@ -1125,6 +1114,7 @@ async fn log_error(
     tools: &[String],
     streaming: bool,
     error: String,
+    status: Option<u16>,
 ) {
     tracing::error!("{}", error);
     let entry = HttpLogEntry {
@@ -1135,50 +1125,13 @@ async fn log_error(
         items,
         tools: tools.to_vec(),
         streaming,
-        status: None,
+        status,
         stop_reason: None,
         input_tokens: None,
         output_tokens: None,
         error: Some(error),
     };
-    let mut buf = state.log_buffer.lock().await;
-    if buf.len() >= LOG_BUFFER_MAX {
-        buf.pop_front();
-    }
-    buf.push_back(entry);
-}
-
-async fn log_error_complete(
-    state: &HttpServerState,
-    model: &str,
-    reasoning_effort: ReasoningEffortConfig,
-    reasoning_source: &'static str,
-    items: usize,
-    tools: &[String],
-    streaming: bool,
-    error: String,
-    status: u16,
-) {
-    tracing::error!("{}", error);
-    let entry = HttpLogEntry {
-        timestamp: Utc::now(),
-        model: model.to_string(),
-        reasoning_effort,
-        reasoning_source: reasoning_source.to_string(),
-        items,
-        tools: tools.to_vec(),
-        streaming,
-        status: Some(status),
-        stop_reason: None,
-        input_tokens: None,
-        output_tokens: None,
-        error: Some(error),
-    };
-    let mut buf = state.log_buffer.lock().await;
-    if buf.len() >= LOG_BUFFER_MAX {
-        buf.pop_front();
-    }
-    buf.push_back(entry);
+    append_log(&state.log_buffer, entry).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,12 +1181,8 @@ impl StreamTranslator {
         }
     }
 
-    fn stop_reason(&self) -> String {
-        if self.has_function_call {
-            "tool_use".to_string()
-        } else {
-            "end_turn".to_string()
-        }
+    fn stop_reason(&self) -> &'static str {
+        if self.has_function_call { "tool_use" } else { "end_turn" }
     }
 
     fn input_tokens(&self) -> Option<u32> {
@@ -1347,9 +1296,8 @@ impl StreamTranslator {
                 let idx = self.next_block;
                 self.next_block += 1;
                 self.call_id_to_block.insert(call_id.clone(), idx);
-                let block_id = call_id.clone();
                 self.blocks.push(BlockState::ToolUse {
-                    id: block_id.clone(),
+                    id: call_id.clone(),
                     name: name.clone(),
                     input: String::new(),
                 });
@@ -1363,7 +1311,7 @@ impl StreamTranslator {
                     "index": idx,
                     "content_block": {
                         "type": "tool_use",
-                        "id": block_id,
+                        "id": call_id,
                         "name": name,
                         "input": {}
                     }
