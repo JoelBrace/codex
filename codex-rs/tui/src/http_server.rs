@@ -182,6 +182,9 @@ pub struct HttpServerDynamicConfig {
     /// When a request model contains a key as a substring, the matching
     /// model + effort is used instead of the TUI default.
     pub named_models: HashMap<String, (String, Option<ReasoningEffortConfig>)>,
+    /// Comma-separated list of enabled experimental feature keys for the
+    /// `x-codex-beta-features` header (mirrors `Session::build_model_client_beta_features_header`).
+    pub beta_features_header: Option<String>,
     model_info_cache: ModelInfo,
 }
 
@@ -193,6 +196,7 @@ impl HttpServerDynamicConfig {
         reasoning_summary: Option<ReasoningSummaryConfig>,
         ws_enabled: bool,
         enable_request_compression: bool,
+        beta_features_header: Option<String>,
     ) -> Self {
         let model_info_cache = proxy_model_info(&model);
         Self {
@@ -203,6 +207,7 @@ impl HttpServerDynamicConfig {
             ws_enabled,
             enable_request_compression,
             named_models: HashMap::new(),
+            beta_features_header,
             model_info_cache,
         }
     }
@@ -261,7 +266,7 @@ impl HttpServerDynamicConfig {
 // ---------------------------------------------------------------------------
 
 /// How many pre-warmed clients to keep in the pool.
-const WARM_POOL_TARGET: usize = 2;
+const WARM_POOL_TARGET: usize = 4;
 
 /// Evict session-cache entries idle for longer than this.
 const SESSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -677,6 +682,7 @@ fn create_proxy_client(
     provider: &ModelProviderInfo,
     ws_enabled: bool,
     enable_request_compression: bool,
+    beta_features_header: Option<String>,
 ) -> ModelClient {
     ModelClient::new(
         Some(auth_manager.clone()),
@@ -687,7 +693,7 @@ fn create_proxy_client(
         ws_enabled,
         enable_request_compression,
         false, // include_timing_metrics
-        None,  // beta_features_header
+        beta_features_header,
     )
 }
 
@@ -717,13 +723,17 @@ fn spawn_pool_refill(
     tokio::spawn(async move {
         let current_len = state.warm_pool.lock().await.len();
         let needed = WARM_POOL_TARGET.saturating_sub(current_len);
-        let provider = state.dynamic_config.read().await.provider.clone();
+        let (provider, beta_features_header) = {
+            let cfg = state.dynamic_config.read().await;
+            (cfg.provider.clone(), cfg.beta_features_header.clone())
+        };
         for _ in 0..needed {
             let client = create_proxy_client(
                 &state.auth_manager,
                 &provider,
                 key.ws_enabled,
                 key.enable_request_compression,
+                beta_features_header.clone(),
             );
             let mut session = client.new_session();
             let prompt = Prompt::default();
@@ -765,6 +775,7 @@ async fn checkout_or_create_client(
     ws_enabled: bool,
     enable_request_compression: bool,
     model_info: &ModelInfo,
+    beta_features_header: Option<String>,
 ) -> ModelClient {
     let key = transport_key(provider, ws_enabled, enable_request_compression);
 
@@ -779,7 +790,7 @@ async fn checkout_or_create_client(
         entry.client
     } else {
         // Cold fallback: fresh client, fresh (empty) WebSocket session.
-        create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression)
+        create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression, beta_features_header)
     };
 
     // Refill pool in background so future requests are warm.
@@ -868,7 +879,7 @@ async fn handle_messages(
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, named_models, model_info, provider, reasoning_effort, reasoning_summary, ws_enabled, enable_request_compression) = {
+    let (model, named_models, model_info, provider, reasoning_effort, reasoning_summary, ws_enabled, enable_request_compression, beta_features_header) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
@@ -879,6 +890,7 @@ async fn handle_messages(
             cfg.reasoning_summary.clone(),
             cfg.ws_enabled,
             cfg.enable_request_compression,
+            cfg.beta_features_header.clone(),
         )
     };
 
@@ -965,10 +977,10 @@ async fn handle_messages(
         let entry = state.session_cache.lock().await.remove(sid);
         match entry {
             Some(e) if e.key == key => e.client,
-            _ => create_proxy_client(&state.auth_manager, &provider, ws_enabled, enable_request_compression),
+            _ => checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &resolved_model_info, beta_features_header).await,
         }
     } else {
-        checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &resolved_model_info).await
+        checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &resolved_model_info, beta_features_header).await
     };
     let mut session = client.new_session();
 

@@ -98,6 +98,7 @@ use codex_core::lookup_message_history_entry;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
+use codex_features::FEATURES;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
@@ -3800,6 +3801,22 @@ impl App {
         // into the App struct.
         let http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>> =
             Arc::new(Mutex::new(VecDeque::new()));
+        let beta_features_header = {
+            let h = FEATURES
+                .iter()
+                .filter_map(|spec| {
+                    if spec.stage.experimental_menu_description().is_some()
+                        && config.features.enabled(spec.id)
+                    {
+                        Some(spec.key)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            if h.is_empty() { None } else { Some(h) }
+        };
         let http_server_dynamic_config = Arc::new(RwLock::new(
             crate::http_server::HttpServerDynamicConfig::new(
                 config
@@ -3811,6 +3828,7 @@ impl App {
                 config.model_reasoning_summary,
                 codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
+                beta_features_header,
             ),
         ));
 
@@ -9399,6 +9417,7 @@ guardian_approval = true
                 config.model_reasoning_summary,
                 codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
+                None, // beta_features_header
             ),
         ));
 
@@ -9471,6 +9490,7 @@ guardian_approval = true
                 config.model_reasoning_summary,
                 codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
+                None, // beta_features_header
             ),
         ));
 
