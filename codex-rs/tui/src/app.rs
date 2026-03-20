@@ -3814,6 +3814,60 @@ impl App {
             ),
         ));
 
+        // Initialize named HTTP model configs with defaults for "haiku" and "opus".
+        {
+            let current_model = config
+                .model
+                .clone()
+                .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+            let mut named_models: HashMap<String, (String, Option<ReasoningEffortConfig>)> =
+                HashMap::new();
+
+            // Populate from persisted config.
+            for (name, cfg) in &config.http_model_names {
+                let model_slug = cfg.model.clone().unwrap_or_else(|| current_model.clone());
+                named_models.insert(name.clone(), (model_slug, cfg.reasoning_effort));
+            }
+
+            // Persist and insert any missing defaults.
+            let mut builder = ConfigEditsBuilder::new(&config.codex_home);
+            let mut needs_persist = false;
+            if !named_models.contains_key("haiku") {
+                named_models.insert(
+                    "haiku".to_string(),
+                    (current_model.clone(), Some(ReasoningEffortConfig::Low)),
+                );
+                builder = builder.set_http_model_name(
+                    "haiku",
+                    &current_model,
+                    Some(ReasoningEffortConfig::Low),
+                );
+                needs_persist = true;
+            }
+            if !named_models.contains_key("opus") {
+                named_models.insert(
+                    "opus".to_string(),
+                    (current_model.clone(), Some(ReasoningEffortConfig::High)),
+                );
+                builder = builder.set_http_model_name(
+                    "opus",
+                    &current_model,
+                    Some(ReasoningEffortConfig::High),
+                );
+                needs_persist = true;
+            }
+            if needs_persist {
+                if let Err(err) = builder.apply().await {
+                    tracing::warn!("Failed to persist default named HTTP models: {err}");
+                }
+            }
+
+            http_server_dynamic_config
+                .write()
+                .await
+                .set_named_models(named_models);
+        }
+
         let mut app = Self {
             model_catalog,
             session_telemetry: session_telemetry.clone(),
@@ -4580,15 +4634,15 @@ impl App {
             AppEvent::RealtimeWebrtcLocalAudioLevel(peak) => {
                 self.chat_widget.on_realtime_webrtc_local_audio_level(peak);
             }
-            AppEvent::OpenReasoningPopup { model } => {
-                self.chat_widget.open_reasoning_popup(model);
+            AppEvent::OpenReasoningPopup { model, named_model } => {
+                self.chat_widget.open_reasoning_popup(model, named_model);
             }
             AppEvent::OpenPlanReasoningScopePrompt { model, effort } => {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
-            AppEvent::OpenAllModelsPopup { models } => {
-                self.chat_widget.open_all_models_popup(models);
+            AppEvent::OpenAllModelsPopup { models, named_model } => {
+                self.chat_widget.open_all_models_popup(models, named_model);
             }
             AppEvent::OpenFullAccessConfirmation {
                 preset,
@@ -5640,6 +5694,78 @@ impl App {
                 self.overlay = Some(crate::pager_overlay::Overlay::Logs(
                     crate::logs_overlay::LogsOverlay::new(self.http_server_log_buffer.clone()),
                 ));
+            }
+            AppEvent::PersistNamedModelSelection { name, model, effort } => {
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_http_model_name(&name, &model, effort)
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let mut cfg = self.http_server_dynamic_config.write().await;
+                        cfg.set_named_model(name.clone(), model.clone(), effort);
+                        drop(cfg);
+                        let effort_label = effort
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        self.chat_widget.add_info_message(
+                            format!(
+                                "Named model '{name}' set to {model} with {effort_label} reasoning"
+                            ),
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to persist named model selection");
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save named model '{name}': {err}"
+                        ));
+                    }
+                }
+            }
+            AppEvent::DeleteNamedModel { name } => {
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .delete_http_model_name(&name)
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let mut cfg = self.http_server_dynamic_config.write().await;
+                        cfg.remove_named_model(&name);
+                        drop(cfg);
+                        self.chat_widget
+                            .add_info_message(format!("Named model '{name}' deleted"), None);
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to delete named model");
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to delete named model '{name}': {err}"
+                        ));
+                    }
+                }
+            }
+            AppEvent::ListNamedModels => {
+                let cfg = self.http_server_dynamic_config.read().await;
+                let named = &cfg.named_models;
+                if named.is_empty() {
+                    self.chat_widget
+                        .add_info_message("No named models configured.".to_string(), None);
+                } else {
+                    let mut lines: Vec<String> = named
+                        .iter()
+                        .map(|(name, (model, effort))| {
+                            let effort_label = effort
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "default".to_string());
+                            format!("  {name}: {model} ({effort_label})")
+                        })
+                        .collect();
+                    lines.sort();
+                    self.chat_widget.add_info_message(
+                        format!("Named HTTP models:\n{}", lines.join("\n")),
+                        None,
+                    );
+                }
             }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = codex_core::config::edit::syntax_theme_edit(&name);

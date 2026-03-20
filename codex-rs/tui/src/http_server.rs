@@ -176,6 +176,12 @@ pub struct HttpServerDynamicConfig {
     pub ws_enabled: bool,
     /// Whether to enable zstd request compression (mirrors core feature flag).
     pub enable_request_compression: bool,
+    /// Named model overrides for the HTTP proxy.
+    ///
+    /// Key = name (e.g. "haiku"), value = (model slug, optional effort).
+    /// When a request model contains a key as a substring, the matching
+    /// model + effort is used instead of the TUI default.
+    pub named_models: HashMap<String, (String, Option<ReasoningEffortConfig>)>,
     model_info_cache: ModelInfo,
 }
 
@@ -196,8 +202,32 @@ impl HttpServerDynamicConfig {
             reasoning_summary: reasoning_summary.unwrap_or(ReasoningSummaryConfig::Auto),
             ws_enabled,
             enable_request_compression,
+            named_models: HashMap::new(),
             model_info_cache,
         }
+    }
+
+    /// Replace the entire named models map.
+    pub fn set_named_models(
+        &mut self,
+        named_models: HashMap<String, (String, Option<ReasoningEffortConfig>)>,
+    ) {
+        self.named_models = named_models;
+    }
+
+    /// Insert or update a single named model entry.
+    pub fn set_named_model(
+        &mut self,
+        name: String,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+    ) {
+        self.named_models.insert(name, (model, effort));
+    }
+
+    /// Remove a named model entry.
+    pub fn remove_named_model(&mut self, name: &str) {
+        self.named_models.remove(name);
     }
 
     pub fn set_model(&mut self, model: String) {
@@ -763,45 +793,44 @@ async fn checkout_or_create_client(
 // Unified reasoning effort resolver
 // ---------------------------------------------------------------------------
 
-/// Map the Anthropic model name requested by the client to a reasoning effort
-/// override based on model tier. Returns `Some(Low)` for haiku requests so
-/// they always run with minimal reasoning, regardless of the TUI config.
-fn effort_for_model_tier(requested_model: &str) -> Option<ReasoningEffortConfig> {
-    let model = requested_model.to_ascii_lowercase();
-    if model.contains("haiku") {
-        Some(ReasoningEffortConfig::Low)
-    } else if model.contains("opus") {
-        Some(ReasoningEffortConfig::High)
-    } else {
-        None
-    }
-}
-
-/// Resolve the reasoning effort for both logging and the stream call.
+/// Resolve model slug, stream effort, log effort, and source for a request.
 ///
 /// Resolution order:
-/// 1. Model-tier override (haiku → Low).
-/// 2. TUI config.
-/// 3. Model default.
+/// 1. Named model lookup: if `requested_model` contains a key from `named_models`
+///    (case-insensitive), use that entry's model slug and effort.
+/// 2. TUI config effort with the default model slug.
+/// 3. Model default effort with the default model slug.
 ///
-/// Returns `(stream_effort, log_effort, source)`.  `stream_effort` is `None`
-/// when falling through to the model default so the model can use its own
-/// default instead of being forced to Medium.
-fn resolve_reasoning(
+/// Returns `(resolved_model, stream_effort, log_effort, source)`.
+/// `stream_effort` is `None` when falling through to the model default so the
+/// model can use its own default instead of being forced to Medium.
+fn resolve_for_request(
     requested_model: &str,
+    named_models: &HashMap<String, (String, Option<ReasoningEffortConfig>)>,
     config_effort: Option<ReasoningEffortConfig>,
     model_info: &ModelInfo,
-) -> (Option<ReasoningEffortConfig>, ReasoningEffortConfig, &'static str) {
-    if let Some(e) = effort_for_model_tier(requested_model) {
-        (Some(e), e, "model_tier")
+    default_model: &str,
+) -> (String, Option<ReasoningEffortConfig>, ReasoningEffortConfig, &'static str) {
+    let lower = requested_model.to_ascii_lowercase();
+    if let Some((named_slug, named_effort)) = named_models
+        .iter()
+        .find(|(name, _)| lower.contains(name.as_str()))
+        .map(|(_, cfg)| cfg)
+    {
+        let log_effort = named_effort.unwrap_or_else(|| {
+            model_info
+                .default_reasoning_level
+                .unwrap_or(ReasoningEffortConfig::Medium)
+        });
+        (named_slug.clone(), *named_effort, log_effort, "named_model")
     } else if let Some(e) = config_effort {
-        (Some(e), e, "config")
+        (default_model.to_string(), Some(e), e, "config")
     } else {
         let e = model_info
             .default_reasoning_level
             .unwrap_or(ReasoningEffortConfig::Medium);
         // Pass `None` so the model uses its own default rather than forcing Medium.
-        (None, e, "model_default")
+        (default_model.to_string(), None, e, "model_default")
     }
 }
 
@@ -839,10 +868,11 @@ async fn handle_messages(
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, model_info, provider, reasoning_effort, reasoning_summary, ws_enabled, enable_request_compression) = {
+    let (model, named_models, model_info, provider, reasoning_effort, reasoning_summary, ws_enabled, enable_request_compression) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
+            cfg.named_models.clone(),
             cfg.model_info().clone(),
             cfg.provider.clone(),
             cfg.reasoning_effort,
@@ -853,8 +883,14 @@ async fn handle_messages(
     };
 
     // Unified reasoning resolution: used for both logging and the stream call.
-    let (stream_effort, log_effort, reasoning_source) =
-        resolve_reasoning(&req.model, reasoning_effort, &model_info);
+    let (resolved_model, stream_effort, log_effort, reasoning_source) =
+        resolve_for_request(&req.model, &named_models, reasoning_effort, &model_info, &model);
+    // If the named model lookup resolved to a different slug, build matching model info.
+    let resolved_model_info = if resolved_model != model {
+        proxy_model_info(&resolved_model)
+    } else {
+        model_info
+    };
 
     // Build prompt.
     let tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
@@ -883,7 +919,7 @@ async fn handle_messages(
     {
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
-            model: model.clone(),
+            model: resolved_model.clone(),
             reasoning_effort: log_effort,
             reasoning_source: reasoning_source.to_string(),
             items: items_count,
@@ -901,8 +937,8 @@ async fn handle_messages(
 
     // Compute scale factor to normalise codex's effective context window to Claude Code's assumed 200k.
     let context_window_scale = {
-        let codex_window = model_info.context_window.unwrap_or(272_000) as f64;
-        let effective = model_info.effective_context_window_percent as f64 / 100.0;
+        let codex_window = resolved_model_info.context_window.unwrap_or(272_000) as f64;
+        let effective = resolved_model_info.effective_context_window_percent as f64 / 100.0;
         CLAUDE_CODE_ASSUMED_CONTEXT_WINDOW / (codex_window * effective)
     };
 
@@ -932,13 +968,12 @@ async fn handle_messages(
             _ => create_proxy_client(&state.auth_manager, &provider, ws_enabled, enable_request_compression),
         }
     } else {
-        checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &model_info).await
+        checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &resolved_model_info).await
     };
-
     let mut session = client.new_session();
 
     let stream_result = session
-        .stream(&prompt, &model_info, &state.session_telemetry, stream_effort, reasoning_summary, None, None)
+        .stream(&prompt, &resolved_model_info, &state.session_telemetry, stream_effort, reasoning_summary, None, None)
         .await;
 
     let mut response_stream = match stream_result {
@@ -947,7 +982,7 @@ async fn handle_messages(
             let msg = format!("Stream error: {e}");
             log_error(
                 &state,
-                &model,
+                &resolved_model,
                 log_effort,
                 reasoning_source,
                 items_count,
@@ -965,7 +1000,7 @@ async fn handle_messages(
         // --- Streaming response: direct stream mapping, no mpsc bridge ---
         let log_buffer = state.log_buffer.clone();
         let state_for_stream = Arc::clone(&state);
-        let model_clone = model.clone();
+        let model_clone = resolved_model.clone();
 
         let sse_stream = async_stream::stream! {
             let mut translator = StreamTranslator::new(model_clone.clone(), context_window_scale);
@@ -1026,7 +1061,7 @@ async fn handle_messages(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     } else {
         // --- Non-streaming: accumulate and return JSON ---
-        let mut translator = StreamTranslator::new(model.clone(), context_window_scale);
+        let mut translator = StreamTranslator::new(resolved_model.clone(), context_window_scale);
         while let Some(event) = response_stream.next().await {
             match event {
                 Ok(ev) => {
@@ -1036,7 +1071,7 @@ async fn handle_messages(
                     let msg = format!("Stream error: {e}");
                     log_error(
                         &state,
-                        &model,
+                        &resolved_model,
                         log_effort,
                         reasoning_source,
                         items_count,
@@ -1064,7 +1099,7 @@ async fn handle_messages(
         let message = translator.build_response(&req.model);
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
-            model: model.clone(),
+            model: resolved_model.clone(),
             reasoning_effort: log_effort,
             reasoning_source: reasoning_source.to_string(),
             items: items_count,

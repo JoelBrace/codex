@@ -185,6 +185,48 @@ pub struct Permissions {
     pub windows_sandbox_private_desktop: bool,
 }
 
+/// A named model configuration for the HTTP proxy server's named-model lookup.
+///
+/// Stored under `[http_model_names]` in `config.toml` using flat key pairs like
+/// `<name>_model` and `<name>_reasoning_effort`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpModelNameConfig {
+    /// Model slug to use (None means use TUI default).
+    pub model: Option<String>,
+    /// Reasoning effort override (None means use TUI default or model default).
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Parse the flat `[http_model_names]` map from config.toml into structured configs.
+///
+/// Looks for pairs of keys `<name>_model` and `<name>_reasoning_effort` and
+/// returns a map from name → `HttpModelNameConfig`.
+pub fn parse_http_model_names(
+    raw: &HashMap<String, String>,
+) -> HashMap<String, HttpModelNameConfig> {
+    let mut result: HashMap<String, HttpModelNameConfig> = HashMap::new();
+    for (key, val) in raw {
+        if let Some(name) = key.strip_suffix("_model") {
+            let entry = result.entry(name.to_string()).or_insert(HttpModelNameConfig {
+                model: None,
+                reasoning_effort: None,
+            });
+            entry.model = Some(val.clone());
+        } else if let Some(name) = key.strip_suffix("_reasoning_effort") {
+            // Deserialize via serde (ReasoningEffort uses #[serde(rename_all = "lowercase")]).
+            let json_str = format!("\"{}\"", val);
+            if let Ok(effort) = serde_json::from_str::<ReasoningEffort>(&json_str) {
+                let entry = result.entry(name.to_string()).or_insert(HttpModelNameConfig {
+                    model: None,
+                    reasoning_effort: None,
+                });
+                entry.reasoning_effort = Some(effort);
+            }
+        }
+    }
+    result
+}
+
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -442,6 +484,10 @@ pub struct Config {
 
     /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
     pub zsh_path: Option<PathBuf>,
+
+    /// Named model configurations for the HTTP proxy server.
+    /// Keys match substrings of the requested model name; values specify model + effort.
+    pub http_model_names: HashMap<String, HttpModelNameConfig>,
 
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
@@ -2063,6 +2109,7 @@ impl Config {
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
+            http_model_names: parse_http_model_names(&cfg.http_model_names),
             model_reasoning_effort: config_profile
                 .model_reasoning_effort
                 .or(cfg.model_reasoning_effort),

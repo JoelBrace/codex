@@ -5569,6 +5569,46 @@ impl ChatWidget {
 
         let trimmed = args.trim();
         match cmd {
+            SlashCommand::Model => {
+                let Some((prepared_args, _)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                let trimmed_args = prepared_args.trim();
+                if trimmed_args.is_empty() {
+                    self.dispatch_command(cmd);
+                    return;
+                }
+                let parts: Vec<&str> = trimmed_args.splitn(2, ' ').collect();
+                match parts[0] {
+                    "list" => {
+                        self.app_event_tx.send(AppEvent::ListNamedModels);
+                        self.bottom_pane.drain_pending_submission_state();
+                    }
+                    "add" => {
+                        let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
+                        if name.is_empty() {
+                            self.add_error_message("Usage: /model add <name>".to_string());
+                            return;
+                        }
+                        self.open_model_popup_for_name(name);
+                    }
+                    "delete" => {
+                        let name = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
+                        if name.is_empty() {
+                            self.add_error_message("Usage: /model delete <name>".to_string());
+                            return;
+                        }
+                        self.app_event_tx
+                            .send(AppEvent::DeleteNamedModel { name });
+                        self.bottom_pane.drain_pending_submission_state();
+                    }
+                    name => {
+                        self.open_model_popup_for_name(name.to_string());
+                    }
+                }
+            }
             SlashCommand::Fast => {
                 if trimmed.is_empty() {
                     self.dispatch_command(cmd);
@@ -7924,6 +7964,35 @@ impl ChatWidget {
         });
     }
 
+    /// Open the model+effort picker scoped to a named HTTP model config.
+    ///
+    /// Shows all available models. On selection, emits `PersistNamedModelSelection`
+    /// instead of updating the TUI's active model.
+    pub(crate) fn open_model_popup_for_name(&mut self, name: String) {
+        if !self.is_session_configured() {
+            self.add_info_message(
+                "Model selection is disabled until startup completes.".to_string(),
+                None,
+            );
+            return;
+        }
+        let presets: Vec<ModelPreset> = match self.models_manager.try_list_models() {
+            Ok(models) => models,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
+        let presets: Vec<ModelPreset> = presets
+            .into_iter()
+            .filter(|p| p.show_in_picker)
+            .collect();
+        self.open_all_models_popup(presets, Some(name));
+    }
+
     /// Open a popup to choose a quick auto model. Selecting "All models"
     /// opens the full picker with every available preset.
     pub(crate) fn open_model_popup(&mut self) {
@@ -8232,7 +8301,7 @@ impl ChatWidget {
             .partition(|preset| Self::is_auto_model(&preset.model));
 
         if auto_presets.is_empty() {
-            self.open_all_models_popup(other_presets);
+            self.open_all_models_popup(other_presets, None);
             return;
         }
 
@@ -8269,6 +8338,7 @@ impl ChatWidget {
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 tx.send(AppEvent::OpenAllModelsPopup {
                     models: all_models.clone(),
+                    named_model: None,
                 });
             })];
 
@@ -8312,7 +8382,11 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn open_all_models_popup(&mut self, presets: Vec<ModelPreset>) {
+    pub(crate) fn open_all_models_popup(
+        &mut self,
+        presets: Vec<ModelPreset>,
+        named_model: Option<String>,
+    ) {
         if presets.is_empty() {
             self.add_info_message(
                 "No additional models are available right now.".to_string(),
@@ -8328,10 +8402,12 @@ impl ChatWidget {
             let is_current = preset.model.as_str() == self.current_model();
             let single_supported_effort = preset.supported_reasoning_efforts.len() == 1;
             let preset_for_action = preset.clone();
+            let named_model_clone = named_model.clone();
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                 let preset_for_event = preset_for_action.clone();
                 tx.send(AppEvent::OpenReasoningPopup {
                     model: preset_for_event,
+                    named_model: named_model_clone.clone(),
                 });
             })];
             items.push(SelectionItem {
@@ -8532,7 +8608,10 @@ impl ChatWidget {
     }
 
     /// Open a popup to choose the reasoning effort (stage 2) for the given model.
-    pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset) {
+    ///
+    /// When `named_model` is `Some`, the selection emits `PersistNamedModelSelection`
+    /// instead of updating the TUI's active model.
+    pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset, named_model: Option<String>) {
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
         let supported = preset.supported_reasoning_efforts;
         let in_plan_mode =
@@ -8582,7 +8661,13 @@ impl ChatWidget {
         if choices.len() == 1 {
             let selected_effort = choices.first().and_then(|c| c.stored);
             let selected_model = preset.model;
-            if self.should_prompt_plan_mode_reasoning_scope(&selected_model, selected_effort) {
+            if let Some(n) = named_model {
+                self.app_event_tx.send(AppEvent::PersistNamedModelSelection {
+                    name: n,
+                    model: selected_model,
+                    effort: selected_effort,
+                });
+            } else if self.should_prompt_plan_mode_reasoning_scope(&selected_model, selected_effort) {
                 self.app_event_tx
                     .send(AppEvent::OpenPlanReasoningScopePrompt {
                         model: selected_model,
@@ -8657,8 +8742,15 @@ impl ChatWidget {
             let choice_effort = choice.stored;
             let should_prompt_plan_mode_scope =
                 self.should_prompt_plan_mode_reasoning_scope(model_slug.as_str(), choice_effort);
+            let named_model_for_action = named_model.clone();
             let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                if should_prompt_plan_mode_scope {
+                if let Some(n) = named_model_for_action.clone() {
+                    tx.send(AppEvent::PersistNamedModelSelection {
+                        name: n,
+                        model: model_for_action.clone(),
+                        effort: choice_effort,
+                    });
+                } else if should_prompt_plan_mode_scope {
                     tx.send(AppEvent::OpenPlanReasoningScopePrompt {
                         model: model_for_action.clone(),
                         effort: choice_effort,

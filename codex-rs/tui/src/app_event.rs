@@ -357,6 +357,9 @@ pub(crate) enum AppEvent {
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,
+        /// When set, the selection will be saved as a named HTTP model config
+        /// rather than updating the TUI's active model.
+        named_model: Option<String>,
     },
 
     /// Open the Plan-mode reasoning scope prompt for the selected model/effort.
@@ -368,6 +371,8 @@ pub(crate) enum AppEvent {
     /// Open the full model picker (non-auto models).
     OpenAllModelsPopup {
         models: Vec<ModelPreset>,
+        /// When set, the selection will be saved as a named HTTP model config.
+        named_model: Option<String>,
     },
 
     /// Open the confirmation prompt before enabling full access mode.
@@ -603,6 +608,19 @@ pub(crate) enum AppEvent {
 
     /// Open the HTTP server logs overlay.
     ShowHttpServerLogs,
+
+    /// Persist a named HTTP model config (for the http server's named model lookup).
+    PersistNamedModelSelection {
+        name: String,
+        model: String,
+        effort: Option<ReasoningEffort>,
+    },
+
+    /// Delete a named HTTP model config.
+    DeleteNamedModel { name: String },
+
+    /// List all named HTTP model configs as an info message.
+    ListNamedModels,
 }
 
 #[derive(Debug)]

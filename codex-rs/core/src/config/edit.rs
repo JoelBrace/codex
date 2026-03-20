@@ -1051,6 +1051,57 @@ impl ConfigEditsBuilder {
         self
     }
 
+    /// Set or update a named HTTP model config entry under `[http_model_names]`.
+    ///
+    /// Writes `<name>_model = <model>` and optionally `<name>_reasoning_effort = <effort>`.
+    pub fn set_http_model_name(
+        mut self,
+        name: &str,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> Self {
+        self.edits.push(ConfigEdit::SetPath {
+            segments: vec![
+                "http_model_names".to_string(),
+                format!("{}_model", name),
+            ],
+            value: value(model.to_string()),
+        });
+        match effort {
+            Some(e) => self.edits.push(ConfigEdit::SetPath {
+                segments: vec![
+                    "http_model_names".to_string(),
+                    format!("{}_reasoning_effort", name),
+                ],
+                value: value(e.to_string()),
+            }),
+            None => self.edits.push(ConfigEdit::ClearPath {
+                segments: vec![
+                    "http_model_names".to_string(),
+                    format!("{}_reasoning_effort", name),
+                ],
+            }),
+        }
+        self
+    }
+
+    /// Remove a named HTTP model config entry from `[http_model_names]`.
+    pub fn delete_http_model_name(mut self, name: &str) -> Self {
+        self.edits.push(ConfigEdit::ClearPath {
+            segments: vec![
+                "http_model_names".to_string(),
+                format!("{}_model", name),
+            ],
+        });
+        self.edits.push(ConfigEdit::ClearPath {
+            segments: vec![
+                "http_model_names".to_string(),
+                format!("{}_reasoning_effort", name),
+            ],
+        });
+        self
+    }
+
     pub fn with_edits<I>(mut self, edits: I) -> Self
     where
         I: IntoIterator<Item = ConfigEdit>,

@@ -96,7 +96,7 @@ impl SlashCommand {
             SlashCommand::Stop => "stop all background terminals",
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
-            SlashCommand::Model => "choose what model and reasoning effort to use",
+            SlashCommand::Model => "choose model/effort; /model list|add <name>|<name>|delete <name>",
             SlashCommand::Fast => "toggle Fast mode to enable fastest inference at 2X plan usage",
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
@@ -131,7 +131,8 @@ impl SlashCommand {
     pub fn supports_inline_args(self) -> bool {
         matches!(
             self,
-            SlashCommand::Review
+            SlashCommand::Model
+                | SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Fast
