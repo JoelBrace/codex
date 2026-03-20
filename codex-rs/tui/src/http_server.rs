@@ -37,7 +37,6 @@ use codex_core::ModelClient;
 use codex_core::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ResponsesWebsocketVersion;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -73,7 +72,6 @@ use uuid::Uuid;
 #[derive(Clone, PartialEq, Eq)]
 struct TransportKey {
     provider_name: String,
-    ws_enabled: bool,
     enable_request_compression: bool,
 }
 
@@ -172,8 +170,6 @@ pub struct HttpServerDynamicConfig {
     pub reasoning_effort: Option<ReasoningEffortConfig>,
     /// Reasoning summary mode.
     pub reasoning_summary: ReasoningSummaryConfig,
-    /// Whether WebSocket transport is enabled for the Responses API.
-    pub ws_enabled: bool,
     /// Whether to enable zstd request compression (mirrors core feature flag).
     pub enable_request_compression: bool,
     /// Named model overrides for the HTTP proxy.
@@ -194,7 +190,6 @@ impl HttpServerDynamicConfig {
         provider: ModelProviderInfo,
         reasoning_effort: Option<ReasoningEffortConfig>,
         reasoning_summary: Option<ReasoningSummaryConfig>,
-        ws_enabled: bool,
         enable_request_compression: bool,
         beta_features_header: Option<String>,
     ) -> Self {
@@ -204,7 +199,6 @@ impl HttpServerDynamicConfig {
             provider,
             reasoning_effort,
             reasoning_summary: reasoning_summary.unwrap_or(ReasoningSummaryConfig::Auto),
-            ws_enabled,
             enable_request_compression,
             named_models: HashMap::new(),
             beta_features_header,
@@ -541,6 +535,7 @@ fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseItem> {
                                 arguments: serde_json::to_string(input)
                                     .unwrap_or_else(|_| "{}".to_string()),
                                 call_id: id.clone(),
+                                namespace: None,
                             });
                         }
                         AnthropicBlock::ToolResult {
@@ -661,10 +656,10 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
-        prefer_websockets: false,
         used_fallback_model_metadata: true,
         supports_image_detail_original: false,
         web_search_tool_type: WebSearchToolType::Text,
+        supports_search_tool: false,
     }
 }
 
@@ -680,7 +675,6 @@ fn proxy_model_info(slug: &str) -> ModelInfo {
 fn create_proxy_client(
     auth_manager: &Arc<AuthManager>,
     provider: &ModelProviderInfo,
-    ws_enabled: bool,
     enable_request_compression: bool,
     beta_features_header: Option<String>,
 ) -> ModelClient {
@@ -690,7 +684,6 @@ fn create_proxy_client(
         provider.clone(),
         SessionSource::Cli,
         None,  // model_verbosity
-        ws_enabled,
         enable_request_compression,
         false, // include_timing_metrics
         beta_features_header,
@@ -700,12 +693,10 @@ fn create_proxy_client(
 /// Compute a transport key from the current config snapshot.
 fn transport_key(
     provider: &ModelProviderInfo,
-    ws_enabled: bool,
     enable_request_compression: bool,
 ) -> TransportKey {
     TransportKey {
         provider_name: provider.name.clone(),
-        ws_enabled,
         enable_request_compression,
     }
 }
@@ -731,7 +722,6 @@ fn spawn_pool_refill(
             let client = create_proxy_client(
                 &state.auth_manager,
                 &provider,
-                key.ws_enabled,
                 key.enable_request_compression,
                 beta_features_header.clone(),
             );
@@ -772,12 +762,11 @@ fn spawn_pool_refill(
 async fn checkout_or_create_client(
     state: &Arc<HttpServerState>,
     provider: &ModelProviderInfo,
-    ws_enabled: bool,
     enable_request_compression: bool,
     model_info: &ModelInfo,
     beta_features_header: Option<String>,
 ) -> ModelClient {
-    let key = transport_key(provider, ws_enabled, enable_request_compression);
+    let key = transport_key(provider, enable_request_compression);
 
     // Try to pop a matching warm entry (lock held briefly, no I/O).
     let warm = {
@@ -790,7 +779,7 @@ async fn checkout_or_create_client(
         entry.client
     } else {
         // Cold fallback: fresh client, fresh (empty) WebSocket session.
-        create_proxy_client(&state.auth_manager, provider, ws_enabled, enable_request_compression, beta_features_header)
+        create_proxy_client(&state.auth_manager, provider, enable_request_compression, beta_features_header)
     };
 
     // Refill pool in background so future requests are warm.
@@ -879,7 +868,7 @@ async fn handle_messages(
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, named_models, model_info, provider, reasoning_effort, reasoning_summary, ws_enabled, enable_request_compression, beta_features_header) = {
+    let (model, named_models, model_info, provider, reasoning_effort, reasoning_summary, enable_request_compression, beta_features_header) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
@@ -888,7 +877,6 @@ async fn handle_messages(
             cfg.provider.clone(),
             cfg.reasoning_effort,
             cfg.reasoning_summary.clone(),
-            cfg.ws_enabled,
             cfg.enable_request_compression,
             cfg.beta_features_header.clone(),
         )
@@ -970,17 +958,17 @@ async fn handle_messages(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let key = transport_key(&provider, ws_enabled, enable_request_compression);
+    let key = transport_key(&provider, enable_request_compression);
 
     let client = if let Some(ref sid) = session_id {
         // Take the entry out of the cache (preventing concurrent reuse).
         let entry = state.session_cache.lock().await.remove(sid);
         match entry {
             Some(e) if e.key == key => e.client,
-            _ => checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &resolved_model_info, beta_features_header).await,
+            _ => checkout_or_create_client(&state, &provider, enable_request_compression, &resolved_model_info, beta_features_header).await,
         }
     } else {
-        checkout_or_create_client(&state, &provider, ws_enabled, enable_request_compression, &resolved_model_info, beta_features_header).await
+        checkout_or_create_client(&state, &provider, enable_request_compression, &resolved_model_info, beta_features_header).await
     };
     let mut session = client.new_session();
 

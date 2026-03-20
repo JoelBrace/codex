@@ -65,6 +65,8 @@ impl Prompt {
             description,
             strict: false,
             parameters: schema,
+            defer_loading: None,
+            output_schema: None,
         }));
         Ok(())
     }
@@ -78,6 +80,9 @@ impl Prompt {
         self.tools.push(ToolSpec::WebSearch {
             external_web_access: Some(live),
             search_content_types: None,
+            filters: None,
+            search_context_size: None,
+            user_location: None,
         });
     }
 

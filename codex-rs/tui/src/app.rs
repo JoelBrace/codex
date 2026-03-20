@@ -3826,7 +3826,6 @@ impl App {
                 config.model_provider.clone(),
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
-                codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
                 beta_features_header,
             ),
@@ -9415,7 +9414,6 @@ guardian_approval = true
                 config.model_provider.clone(),
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
-                codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
                 None, // beta_features_header
             ),
@@ -9488,7 +9486,6 @@ guardian_approval = true
                 config.model_provider.clone(),
                 config.model_reasoning_effort,
                 config.model_reasoning_summary,
-                codex_core::ws_version_from_features(&config),
                 config.features.enabled(Feature::EnableRequestCompression),
                 None, // beta_features_header
             ),
