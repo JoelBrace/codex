@@ -22,6 +22,35 @@ use super::wire_types::AnthropicRequest;
 use super::wire_types::AnthropicToolResultBlock;
 use super::wire_types::AnthropicToolResultContent;
 
+/// Serialise a JSON value to a compact canonical form with object keys sorted
+/// lexicographically. This ensures that two semantically identical tool-call
+/// inputs produce the same `arguments` string regardless of the key order
+/// they arrived in, preserving upstream prefix-cache hits.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut pairs: Vec<(&String, &Value)> = map.iter().collect();
+            pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let body: Vec<String> = pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonical_json(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", body.join(","))
+        }
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
 /// Translate an Anthropic request body into the internal `Prompt` type.
 pub(super) fn translate_request(req: &AnthropicRequest, _model: &str) -> anyhow::Result<Prompt> {
     let _ = (
@@ -160,7 +189,7 @@ pub(super) fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseI
                             items.push(ResponseItem::FunctionCall {
                                 id: None,
                                 name: name.clone(),
-                                arguments: input.to_string(),
+                                arguments: canonical_json(&input),
                                 call_id: id.clone(),
                                 namespace: None,
                             });

@@ -69,6 +69,7 @@ pub struct HttpLogEntry {
     pub items: usize,
     pub tools: Vec<String>,
     pub streaming: bool,
+    pub session_id: Option<String>,
     pub status: Option<u16>,
     pub stop_reason: Option<String>,
     pub input_tokens: Option<u32>,
@@ -80,14 +81,17 @@ impl HttpLogEntry {
     /// The `→` line emitted when a request arrives (codex-wrapper format).
     pub fn request_line(&self) -> String {
         let tools = self.tools.join(",");
+        let session_full = self.session_id.as_deref().unwrap_or("-");
+        let session = &session_full[..session_full.len().min(8)];
         format!(
-            "[codex] → model={} effort={} effort_src={} items={} tools=[{}] client={}",
+            "[codex] → model={} effort={} effort_src={} items={} tools=[{}] client={} session={}",
             self.model,
             self.reasoning_effort,
             self.reasoning_source,
             self.items,
             tools,
             if self.streaming { "stream" } else { "sync" },
+            session,
         )
     }
 

@@ -87,6 +87,12 @@ pub(super) async fn handle_messages(
     };
     let stream_mode = req.stream;
 
+    let session_id = headers
+        .get("x-codex-session-id")
+        .or_else(|| headers.get("x-claude-code-session-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     // Read dynamic config snapshot.
     let (
         model,
@@ -146,6 +152,7 @@ pub(super) async fn handle_messages(
                 stream_mode,
                 format!("Failed to translate request: {e}"),
                 None,
+                session_id.as_deref(),
             )
             .await;
             return anthropic_error_response(
@@ -171,6 +178,7 @@ pub(super) async fn handle_messages(
             items: items_count,
             tools: tool_names.clone(),
             streaming: stream_mode,
+            session_id: session_id.clone(),
             status: None,
             stop_reason: None,
             input_tokens: None,
@@ -199,12 +207,6 @@ pub(super) async fn handle_messages(
     // create a fresh one). Each such request gets its own `conversation_id`,
     // preventing backend serialisation of unrelated concurrent requests and
     // eliminating stale-WebSocket reuse.
-    let session_id = headers
-        .get("x-codex-session-id")
-        .or_else(|| headers.get("x-claude-code-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-
     let key = transport_key(&provider, enable_request_compression);
 
     let client = if let Some(ref sid) = session_id {
@@ -234,6 +236,7 @@ pub(super) async fn handle_messages(
         .await
     };
     let mut session = client.new_session();
+    session.prompt_cache_key = session_id.clone();
 
     let service_tier = parse_service_tier(&req);
     let stream_result = session
@@ -262,6 +265,7 @@ pub(super) async fn handle_messages(
                 stream_mode,
                 msg.clone(),
                 Some(503),
+                session_id.as_deref(),
             )
             .await;
             return anthropic_error_response(
@@ -337,6 +341,7 @@ pub(super) async fn handle_messages(
                 items: 0,
                 tools: Vec::new(),
                 streaming: true,
+                session_id: session_id.clone(),
                 status: Some(if had_stream_error { 502 } else { 200 }),
                 stop_reason: Some(translator.stop_reason().to_string()),
                 input_tokens: translator.input_tokens(),
@@ -379,6 +384,7 @@ pub(super) async fn handle_messages(
                         false,
                         msg.clone(),
                         Some(502),
+                        session_id.as_deref(),
                     )
                     .await;
                     return anthropic_error_response(
@@ -414,6 +420,7 @@ pub(super) async fn handle_messages(
             items: items_count,
             tools: tool_names,
             streaming: false,
+            session_id: session_id.clone(),
             status: Some(200),
             stop_reason: Some(translator.stop_reason().to_string()),
             input_tokens: translator.input_tokens(),
@@ -482,6 +489,7 @@ async fn log_error(
     streaming: bool,
     error: String,
     status: Option<u16>,
+    session_id: Option<&str>,
 ) {
     tracing::error!("{}", error);
     let entry = HttpLogEntry {
@@ -492,6 +500,7 @@ async fn log_error(
         items,
         tools: tools.to_vec(),
         streaming,
+        session_id: session_id.map(str::to_owned),
         status,
         stop_reason: None,
         input_tokens: None,

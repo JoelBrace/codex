@@ -222,6 +222,13 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    /// Optional stable key used as `prompt_cache_key` on the upstream Responses API
+    /// request. When set, the server can associate requests sharing this key with a
+    /// cached prompt prefix, improving cache hit rate across turns.
+    ///
+    /// The HTTP proxy sets this to the `X-Claude-Code-Session-Id` header value so that
+    /// all turns within the same Claude Code session share a stable cache key.
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +347,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
+            prompt_cache_key: None,
         }
     }
 
@@ -861,7 +869,7 @@ impl ModelClientSession {
             None
         };
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
-        let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
+        let prompt_cache_key = self.prompt_cache_key.clone();
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
             instructions: instructions.clone(),
