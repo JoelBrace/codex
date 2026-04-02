@@ -24,6 +24,8 @@ pub(super) struct StreamTranslator {
     /// Scale factor applied to input_tokens before reporting to Claude Code.
     /// Normalises codex's effective context window to Claude Code's assumed 200k window.
     context_window_scale: f64,
+    /// If set, overrides the stop_reason returned by stop_reason().
+    stop_reason_override: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -51,15 +53,34 @@ impl StreamTranslator {
             output_tokens: 0,
             blocks: Vec::new(),
             context_window_scale,
+            stop_reason_override: None,
         }
     }
 
-    pub(super) fn stop_reason(&self) -> &'static str {
-        if self.has_function_call {
-            "tool_use"
-        } else {
-            "end_turn"
+    pub(super) fn stop_reason(&self) -> &str {
+        if let Some(r) = self.stop_reason_override {
+            return r;
         }
+        if self.has_function_call { "tool_use" } else { "end_turn" }
+    }
+
+    pub(super) fn set_stop_reason_override(&mut self, reason: &'static str) {
+        self.stop_reason_override = Some(reason);
+    }
+
+    pub(super) fn terminate_with_reason(&self, stop_reason: &str) -> String {
+        let mut out = String::new();
+        if let Some(idx) = self.current_text_block {
+            out += &format_sse("content_block_stop", &serde_json::json!({"type": "content_block_stop", "index": idx}));
+        }
+        let reported_input = (self.input_tokens as f64 * self.context_window_scale).round() as u32;
+        out += &format_sse("message_delta", &serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+            "usage": {"output_tokens": self.output_tokens, "input_tokens": reported_input, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+        }));
+        out += &format_sse("message_stop", &serde_json::json!({"type": "message_stop"}));
+        out
     }
 
     pub(super) fn input_tokens(&self) -> Option<u32> {
@@ -142,7 +163,7 @@ impl StreamTranslator {
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 }
+                "usage": { "input_tokens": self.input_tokens, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0 }
             }
         });
         format_sse("message_start", &message_start)
@@ -282,7 +303,7 @@ impl StreamTranslator {
         let message_delta = serde_json::json!({
             "type": "message_delta",
             "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-            "usage": { "output_tokens": self.output_tokens, "input_tokens": reported_input_tokens }
+            "usage": { "output_tokens": self.output_tokens, "input_tokens": reported_input_tokens, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0 }
         });
         let message_stop = serde_json::json!({ "type": "message_stop" });
         format_sse("message_delta", &message_delta) + &format_sse("message_stop", &message_stop)

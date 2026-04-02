@@ -11,6 +11,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use chrono::Utc;
+use codex_core::error::CodexErr;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use serde_json::Value;
 use tokio::time::Duration;
@@ -200,6 +201,7 @@ pub(super) async fn handle_messages(
     // eliminating stale-WebSocket reuse.
     let session_id = headers
         .get("x-codex-session-id")
+        .or_else(|| headers.get("x-claude-code-session-id"))
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
@@ -300,10 +302,14 @@ pub(super) async fn handle_messages(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("Stream error: {e}");
-                                had_stream_error = true;
-                                let msg = format!("Stream error: {e}");
-                                let error_payload = anthropic_error_body("api_error", &msg, &req_ctx_for_stream.request_id);
-                                yield Ok::<Bytes, std::io::Error>(Bytes::from(format_sse("error", &error_payload)));
+                                if matches!(e.downcast_ref::<CodexErr>(), Some(CodexErr::ContextWindowExceeded)) {
+                                    let chunks = translator.terminate_with_reason("model_context_window_exceeded");
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(chunks));
+                                } else {
+                                    had_stream_error = true;
+                                    let error_payload = anthropic_error_body("api_error", &format!("Stream error: {e}"), &req_ctx_for_stream.request_id);
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(format_sse("error", &error_payload)));
+                                }
                                 break;
                             }
                             None => break,
@@ -358,6 +364,10 @@ pub(super) async fn handle_messages(
                     translator.consume_event(&ev);
                 }
                 Err(e) => {
+                    if matches!(e.downcast_ref::<CodexErr>(), Some(CodexErr::ContextWindowExceeded)) {
+                        translator.set_stop_reason_override("model_context_window_exceeded");
+                        break;
+                    }
                     let msg = format!("Stream error: {e}");
                     log_error(
                         &state,
@@ -392,7 +402,7 @@ pub(super) async fn handle_messages(
             cache_session(&state.session_cache, sid, client, key).await;
         }
 
-        let message = translator.build_response(&req.model);
+        let message = translator.build_response(&resolved_model);
         let body = Body::from(
             serde_json::to_vec(&message).unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec()),
         );

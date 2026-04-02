@@ -110,7 +110,13 @@ pub(super) fn parse_request_reasoning_effort(
 
     output_effort
         .or(thinking_effort)
-        .and_then(|s| ReasoningEffortConfig::from_str(s).ok())
+        .and_then(|s| {
+            if s.eq_ignore_ascii_case("auto") {
+                None
+            } else {
+                ReasoningEffortConfig::from_str(s).ok()
+            }
+        })
 }
 
 pub(super) fn parse_service_tier(req: &AnthropicRequest) -> Option<ServiceTier> {
