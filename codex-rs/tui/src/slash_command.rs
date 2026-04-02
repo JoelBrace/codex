@@ -96,7 +96,9 @@ impl SlashCommand {
             SlashCommand::Stop => "stop all background terminals",
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
-            SlashCommand::Model => "choose model/effort; /model list|add <name>|<name>|delete <name>",
+            SlashCommand::Model => {
+                "choose model/effort; /model list|add <name>|<name>|delete <name>"
+            }
             SlashCommand::Fast => "toggle Fast mode to enable fastest inference at 2X plan usage",
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
@@ -111,7 +113,9 @@ impl SlashCommand {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
-            SlashCommand::HttpServer => "manage the local HTTP server: /http-server [on|off|status|logs]",
+            SlashCommand::HttpServer => {
+                "manage the local HTTP server: /http-server [on|off|status|logs]"
+            }
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Plugins => "browse plugins",

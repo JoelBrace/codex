@@ -617,7 +617,9 @@ pub(crate) enum AppEvent {
     },
 
     /// Delete a named HTTP model config.
-    DeleteNamedModel { name: String },
+    DeleteNamedModel {
+        name: String,
+    },
 
     /// List all named HTTP model configs as an info message.
     ListNamedModels,

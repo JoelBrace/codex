@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-client"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-app-server",
  "codex-app-server-protocol",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "codex-connectors"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "codex-app-server-protocol",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "codex-exec-server"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "codex-features"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-otel",
  "codex-protocol",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "codex-terminal-detection"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "pretty_assertions",
  "tracing",

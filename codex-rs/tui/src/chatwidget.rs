@@ -5381,10 +5381,7 @@ impl ChatWidget {
                 self.open_experimental_popup();
             }
             SlashCommand::HttpServer => {
-                self.add_info_message(
-                    "Usage: /http-server [on|off|status]".to_string(),
-                    None,
-                );
+                self.add_info_message("Usage: /http-server [on|off|status]".to_string(), None);
             }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.request_quit_without_confirmation();
@@ -5600,8 +5597,7 @@ impl ChatWidget {
                             self.add_error_message("Usage: /model delete <name>".to_string());
                             return;
                         }
-                        self.app_event_tx
-                            .send(AppEvent::DeleteNamedModel { name });
+                        self.app_event_tx.send(AppEvent::DeleteNamedModel { name });
                         self.bottom_pane.drain_pending_submission_state();
                     }
                     name => {
@@ -7986,10 +7982,7 @@ impl ChatWidget {
                 return;
             }
         };
-        let presets: Vec<ModelPreset> = presets
-            .into_iter()
-            .filter(|p| p.show_in_picker)
-            .collect();
+        let presets: Vec<ModelPreset> = presets.into_iter().filter(|p| p.show_in_picker).collect();
         self.open_all_models_popup(presets, Some(name));
     }
 
@@ -8611,7 +8604,11 @@ impl ChatWidget {
     ///
     /// When `named_model` is `Some`, the selection emits `PersistNamedModelSelection`
     /// instead of updating the TUI's active model.
-    pub(crate) fn open_reasoning_popup(&mut self, preset: ModelPreset, named_model: Option<String>) {
+    pub(crate) fn open_reasoning_popup(
+        &mut self,
+        preset: ModelPreset,
+        named_model: Option<String>,
+    ) {
         let default_effort: ReasoningEffortConfig = preset.default_reasoning_effort;
         let supported = preset.supported_reasoning_efforts;
         let in_plan_mode =
@@ -8662,12 +8659,14 @@ impl ChatWidget {
             let selected_effort = choices.first().and_then(|c| c.stored);
             let selected_model = preset.model;
             if let Some(n) = named_model {
-                self.app_event_tx.send(AppEvent::PersistNamedModelSelection {
-                    name: n,
-                    model: selected_model,
-                    effort: selected_effort,
-                });
-            } else if self.should_prompt_plan_mode_reasoning_scope(&selected_model, selected_effort) {
+                self.app_event_tx
+                    .send(AppEvent::PersistNamedModelSelection {
+                        name: n,
+                        model: selected_model,
+                        effort: selected_effort,
+                    });
+            } else if self.should_prompt_plan_mode_reasoning_scope(&selected_model, selected_effort)
+            {
                 self.app_event_tx
                     .send(AppEvent::OpenPlanReasoningScopePrompt {
                         model: selected_model,
@@ -9030,8 +9029,7 @@ impl ChatWidget {
     pub(crate) fn handle_http_server_command(&mut self, arg: &str) {
         match arg {
             "on" => {
-                self.app_event_tx
-                    .send(AppEvent::SetHttpServerEnabled(true));
+                self.app_event_tx.send(AppEvent::SetHttpServerEnabled(true));
                 self.add_info_message(
                     "HTTP server started at localhost:8082 — POST /v1/messages is available"
                         .to_string(),
@@ -9887,7 +9885,10 @@ impl ChatWidget {
     }
 
     /// Set the model in the widget's config copy and stored collaboration mode.
-    pub(crate) fn try_get_model_info(&self, model: &str) -> Option<codex_protocol::openai_models::ModelInfo> {
+    pub(crate) fn try_get_model_info(
+        &self,
+        model: &str,
+    ) -> Option<codex_protocol::openai_models::ModelInfo> {
         self.models_manager.try_get_model_info(model)
     }
 

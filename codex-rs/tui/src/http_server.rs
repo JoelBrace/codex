@@ -19,12 +19,15 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
@@ -40,6 +43,7 @@ use codex_core::ResponseEvent;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -56,9 +60,11 @@ use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::protocol::SessionSource;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio_stream::StreamExt;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::time::Duration;
+use tokio::time::MissedTickBehavior;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,8 @@ const LOG_BUFFER_MAX: usize = 500;
 /// Claude Code assumes this context window size (tokens) when computing usage percentage.
 /// It is hardcoded in the Claude Code binary by model slug and cannot be overridden via API.
 const CLAUDE_CODE_ASSUMED_CONTEXT_WINDOW: f64 = 200_000.0;
+const STREAM_PING_INTERVAL_SECS: u64 = 15;
+const DEFAULT_RETRY_AFTER_SECS: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Log entry
@@ -321,6 +329,22 @@ struct AnthropicRequest {
     #[allow(dead_code)]
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    thinking: Option<Value>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    context_management: Option<Value>,
+    #[serde(default)]
+    output_config: Option<Value>,
+    #[serde(default)]
+    speed: Option<String>,
+    #[serde(default)]
+    betas: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,13 +363,8 @@ enum AnthropicContent {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicImageSource {
-    Base64 {
-        media_type: String,
-        data: String,
-    },
-    Url {
-        url: String,
-    },
+    Base64 { media_type: String, data: String },
+    Url { url: String },
 }
 
 impl AnthropicImageSource {
@@ -393,8 +412,12 @@ enum AnthropicBlock {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicToolResultBlock {
-    Text { text: String },
-    Image { source: AnthropicImageSource },
+    Text {
+        text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -425,6 +448,16 @@ struct AnthropicTool {
 
 /// Translate an Anthropic request body into the internal `Prompt` type.
 fn translate_request(req: &AnthropicRequest, _model: &str) -> anyhow::Result<Prompt> {
+    let _ = (
+        &req.metadata,
+        &req.temperature,
+        &req.context_management,
+        &req.thinking,
+        &req.output_config,
+        &req.speed,
+        &req.betas,
+    );
+
     let system_text = match &req.system {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => {
@@ -448,16 +481,35 @@ fn translate_request(req: &AnthropicRequest, _model: &str) -> anyhow::Result<Pro
     prompt.input = translate_messages(&req.messages);
     prompt.base_instructions = BaseInstructions { text: system_text };
 
+    let tool_choice_none = req
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| match choice {
+            Value::String(s) => Some(s.eq_ignore_ascii_case("none")),
+            Value::Object(map) => map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|s| s.eq_ignore_ascii_case("none")),
+            _ => None,
+        })
+        .unwrap_or(false);
+
     // Tools
-    for tool in &req.tools {
-        if tool.tool_type.starts_with("web_search_") {
-            prompt.add_web_search_tool(true);
-        } else if let Some(schema) = &tool.input_schema {
-            prompt.add_function_tool(tool.name.clone(), tool.description.clone(), schema.clone())?;
+    if !tool_choice_none {
+        for tool in &req.tools {
+            if tool.tool_type.starts_with("web_search_") {
+                prompt.add_web_search_tool(true);
+            } else if let Some(schema) = &tool.input_schema {
+                prompt.add_function_tool(
+                    tool.name.clone(),
+                    tool.description.clone(),
+                    schema.clone(),
+                )?;
+            }
+            // Other unknown built-in tool types (computer_use, etc.) are silently skipped
         }
-        // Other unknown built-in tool types (computer_use, etc.) are silently skipped
     }
-    prompt.set_parallel_tool_calls(true);
+    prompt.set_parallel_tool_calls(!tool_choice_none);
 
     Ok(prompt)
 }
@@ -532,8 +584,7 @@ fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseItem> {
                             items.push(ResponseItem::FunctionCall {
                                 id: None,
                                 name: name.clone(),
-                                arguments: serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string()),
+                                arguments: input.to_string(),
                                 call_id: id.clone(),
                                 namespace: None,
                             });
@@ -572,26 +623,23 @@ fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseItem> {
                                     });
                                 }
                                 AnthropicToolResultContent::Blocks(blocks) => {
-                                    let content_items: Vec<FunctionCallOutputContentItem> =
-                                        blocks
-                                            .iter()
-                                            .filter_map(|b| match b {
-                                                AnthropicToolResultBlock::Text { text } => {
-                                                    Some(FunctionCallOutputContentItem::InputText {
-                                                        text: text.clone(),
-                                                    })
-                                                }
-                                                AnthropicToolResultBlock::Image { source } => {
-                                                    Some(
-                                                        FunctionCallOutputContentItem::InputImage {
-                                                            image_url: source.to_image_url(),
-                                                            detail: None,
-                                                        },
-                                                    )
-                                                }
-                                                AnthropicToolResultBlock::Unknown => None,
-                                            })
-                                            .collect();
+                                    let content_items: Vec<FunctionCallOutputContentItem> = blocks
+                                        .iter()
+                                        .filter_map(|b| match b {
+                                            AnthropicToolResultBlock::Text { text } => {
+                                                Some(FunctionCallOutputContentItem::InputText {
+                                                    text: text.clone(),
+                                                })
+                                            }
+                                            AnthropicToolResultBlock::Image { source } => {
+                                                Some(FunctionCallOutputContentItem::InputImage {
+                                                    image_url: source.to_image_url(),
+                                                    detail: None,
+                                                })
+                                            }
+                                            AnthropicToolResultBlock::Unknown => None,
+                                        })
+                                        .collect();
                                     items.push(ResponseItem::FunctionCallOutput {
                                         call_id: tool_use_id.clone(),
                                         output: FunctionCallOutputPayload::from_content_items(
@@ -683,7 +731,7 @@ fn create_proxy_client(
         ThreadId::new(), // stable conversation_id for the slot lifetime
         provider.clone(),
         SessionSource::Cli,
-        None,  // model_verbosity
+        None, // model_verbosity
         enable_request_compression,
         false, // include_timing_metrics
         beta_features_header,
@@ -691,10 +739,7 @@ fn create_proxy_client(
 }
 
 /// Compute a transport key from the current config snapshot.
-fn transport_key(
-    provider: &ModelProviderInfo,
-    enable_request_compression: bool,
-) -> TransportKey {
+fn transport_key(provider: &ModelProviderInfo, enable_request_compression: bool) -> TransportKey {
     TransportKey {
         provider_name: provider.name.clone(),
         enable_request_compression,
@@ -706,11 +751,7 @@ fn transport_key(
 /// Creates fresh clients (never used for real requests — no stale connections
 /// possible) up to `WARM_POOL_TARGET`, prewarming each WebSocket connection
 /// before pushing it into the pool.
-fn spawn_pool_refill(
-    state: Arc<HttpServerState>,
-    key: TransportKey,
-    model_info: ModelInfo,
-) {
+fn spawn_pool_refill(state: Arc<HttpServerState>, key: TransportKey, model_info: ModelInfo) {
     tokio::spawn(async move {
         let current_len = state.warm_pool.lock().await.len();
         let needed = WARM_POOL_TARGET.saturating_sub(current_len);
@@ -746,11 +787,10 @@ fn spawn_pool_refill(
             // Drop session here: the prewarmed connection is stored back into
             // `client` via `ModelClientSession::drop`.
             drop(session);
-            state
-                .warm_pool
-                .lock()
-                .await
-                .push_back(WarmPoolEntry { client, key: key.clone() });
+            state.warm_pool.lock().await.push_back(WarmPoolEntry {
+                client,
+                key: key.clone(),
+            });
         }
     });
 }
@@ -779,12 +819,16 @@ async fn checkout_or_create_client(
         entry.client
     } else {
         // Cold fallback: fresh client, fresh (empty) WebSocket session.
-        create_proxy_client(&state.auth_manager, provider, enable_request_compression, beta_features_header)
+        create_proxy_client(
+            &state.auth_manager,
+            provider,
+            enable_request_compression,
+            beta_features_header,
+        )
     };
 
     // Refill pool in background so future requests are warm.
     spawn_pool_refill(Arc::clone(state), key, model_info.clone());
-
 
     client
 }
@@ -810,7 +854,12 @@ fn resolve_for_request(
     config_effort: Option<ReasoningEffortConfig>,
     model_info: &ModelInfo,
     default_model: &str,
-) -> (String, Option<ReasoningEffortConfig>, ReasoningEffortConfig, &'static str) {
+) -> (
+    String,
+    Option<ReasoningEffortConfig>,
+    ReasoningEffortConfig,
+    &'static str,
+) {
     let lower = requested_model.to_ascii_lowercase();
     if let Some((named_slug, named_effort)) = named_models
         .iter()
@@ -831,6 +880,117 @@ fn resolve_for_request(
             .unwrap_or(ReasoningEffortConfig::Medium);
         // Pass `None` so the model uses its own default rather than forcing Medium.
         (default_model.to_string(), None, e, "model_default")
+    }
+}
+
+#[derive(Clone)]
+struct RequestContext {
+    request_id: String,
+    client_request_id: Option<String>,
+}
+
+struct RetryHints {
+    should_retry: bool,
+    retry_after_secs: Option<u32>,
+}
+
+fn request_context_from_headers(headers: &axum::http::HeaderMap) -> RequestContext {
+    let client_request_id = headers
+        .get("x-client-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    RequestContext {
+        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        client_request_id,
+    }
+}
+
+fn attach_correlation_headers(
+    mut builder: axum::http::response::Builder,
+    ctx: &RequestContext,
+) -> axum::http::response::Builder {
+    builder = builder
+        .header("request-id", ctx.request_id.as_str())
+        .header("x-request-id", ctx.request_id.as_str());
+    if let Some(client_id) = &ctx.client_request_id {
+        if let Ok(value) = HeaderValue::from_str(client_id) {
+            builder = builder.header("x-client-request-id", value);
+        }
+    }
+    builder
+}
+
+fn anthropic_error_body(error_type: &str, message: &str, request_id: &str) -> Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message
+        },
+        "request_id": request_id
+    })
+}
+
+fn anthropic_error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: String,
+    ctx: &RequestContext,
+    retry_hints: Option<RetryHints>,
+) -> Response {
+    let mut builder = Response::builder().status(status);
+    builder = attach_correlation_headers(builder, ctx);
+    builder = builder.header("content-type", "application/json");
+
+    if let Some(hints) = retry_hints {
+        builder = builder.header(
+            "x-should-retry",
+            if hints.should_retry { "true" } else { "false" },
+        );
+        if let Some(retry_after) = hints.retry_after_secs {
+            builder = builder.header("retry-after", retry_after.to_string());
+        }
+    }
+
+    let body = Body::from(
+        serde_json::to_vec(&anthropic_error_body(error_type, &message, &ctx.request_id))
+            .unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec()),
+    );
+
+    builder
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn parse_request_reasoning_effort(req: &AnthropicRequest) -> Option<ReasoningEffortConfig> {
+    let output_effort = req
+        .output_config
+        .as_ref()
+        .and_then(|cfg| cfg.get("effort"))
+        .and_then(Value::as_str);
+    let thinking_effort = req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.get("effort"))
+        .and_then(Value::as_str);
+
+    output_effort
+        .or(thinking_effort)
+        .and_then(|s| ReasoningEffortConfig::from_str(s).ok())
+}
+
+fn parse_service_tier(req: &AnthropicRequest) -> Option<ServiceTier> {
+    match req.speed.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("fast") => Some(ServiceTier::Fast),
+        Some("flex") => Some(ServiceTier::Flex),
+        _ => None,
+    }
+}
+
+fn stream_retry_hints() -> RetryHints {
+    RetryHints {
+        should_retry: true,
+        retry_after_secs: Some(DEFAULT_RETRY_AFTER_SECS),
     }
 }
 
@@ -862,13 +1022,37 @@ async fn list_models(State(state): State<Arc<HttpServerState>>) -> impl IntoResp
 async fn handle_messages(
     State(state): State<Arc<HttpServerState>>,
     headers: axum::http::HeaderMap,
-    body: axum::extract::Json<AnthropicRequest>,
+    body: Result<axum::extract::Json<AnthropicRequest>, JsonRejection>,
 ) -> Response {
-    let req = body.0;
+    let req_ctx = request_context_from_headers(&headers);
+    let req = match body {
+        Ok(body) => body.0,
+        Err(e) => {
+            return anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid JSON body: {e}"),
+                &req_ctx,
+                Some(RetryHints {
+                    should_retry: false,
+                    retry_after_secs: None,
+                }),
+            );
+        }
+    };
     let stream_mode = req.stream;
 
     // Read dynamic config snapshot.
-    let (model, named_models, model_info, provider, reasoning_effort, reasoning_summary, enable_request_compression, beta_features_header) = {
+    let (
+        model,
+        named_models,
+        model_info,
+        provider,
+        reasoning_effort,
+        reasoning_summary,
+        enable_request_compression,
+        beta_features_header,
+    ) = {
         let cfg = state.dynamic_config.read().await;
         (
             cfg.model.clone(),
@@ -882,9 +1066,17 @@ async fn handle_messages(
         )
     };
 
+    let request_effort = parse_request_reasoning_effort(&req);
+    let effective_reasoning_effort = request_effort.or(reasoning_effort);
+
     // Unified reasoning resolution: used for both logging and the stream call.
-    let (resolved_model, stream_effort, log_effort, reasoning_source) =
-        resolve_for_request(&req.model, &named_models, reasoning_effort, &model_info, &model);
+    let (resolved_model, stream_effort, log_effort, reasoning_source) = resolve_for_request(
+        &req.model,
+        &named_models,
+        effective_reasoning_effort,
+        &model_info,
+        &model,
+    );
     // If the named model lookup resolved to a different slug, build matching model info.
     let resolved_model_info = if resolved_model != model {
         proxy_model_info(&resolved_model)
@@ -911,7 +1103,16 @@ async fn handle_messages(
                 None,
             )
             .await;
-            return (StatusCode::BAD_REQUEST, format!("Bad request: {e}")).into_response();
+            return anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Bad request: {e}"),
+                &req_ctx,
+                Some(RetryHints {
+                    should_retry: false,
+                    retry_after_secs: None,
+                }),
+            );
         }
     };
 
@@ -965,15 +1166,40 @@ async fn handle_messages(
         let entry = state.session_cache.lock().await.remove(sid);
         match entry {
             Some(e) if e.key == key => e.client,
-            _ => checkout_or_create_client(&state, &provider, enable_request_compression, &resolved_model_info, beta_features_header).await,
+            _ => {
+                checkout_or_create_client(
+                    &state,
+                    &provider,
+                    enable_request_compression,
+                    &resolved_model_info,
+                    beta_features_header,
+                )
+                .await
+            }
         }
     } else {
-        checkout_or_create_client(&state, &provider, enable_request_compression, &resolved_model_info, beta_features_header).await
+        checkout_or_create_client(
+            &state,
+            &provider,
+            enable_request_compression,
+            &resolved_model_info,
+            beta_features_header,
+        )
+        .await
     };
     let mut session = client.new_session();
 
+    let service_tier = parse_service_tier(&req);
     let stream_result = session
-        .stream(&prompt, &resolved_model_info, &state.session_telemetry, stream_effort, reasoning_summary, None, None)
+        .stream(
+            &prompt,
+            &resolved_model_info,
+            &state.session_telemetry,
+            stream_effort,
+            reasoning_summary,
+            service_tier,
+            None,
+        )
         .await;
 
     let mut response_stream = match stream_result {
@@ -992,7 +1218,13 @@ async fn handle_messages(
                 Some(503),
             )
             .await;
-            return (StatusCode::SERVICE_UNAVAILABLE, msg).into_response();
+            return anthropic_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                msg,
+                &req_ctx,
+                Some(stream_retry_hints()),
+            );
         }
     };
 
@@ -1002,20 +1234,36 @@ async fn handle_messages(
         let state_for_stream = Arc::clone(&state);
         let model_clone = resolved_model.clone();
 
+        let req_ctx_for_stream = req_ctx.clone();
         let sse_stream = async_stream::stream! {
             let mut translator = StreamTranslator::new(model_clone.clone(), context_window_scale);
+            let mut had_stream_error = false;
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(STREAM_PING_INTERVAL_SECS));
+            ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-            while let Some(event) = response_stream.next().await {
-                match event {
-                    Ok(ev) => {
-                        let sse_chunk = translator.translate(&ev);
-                        if !sse_chunk.is_empty() {
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(sse_chunk));
-                        }
+            loop {
+                tokio::select! {
+                    _ = ping_interval.tick() => {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(format_sse("ping", &serde_json::json!({"type": "ping"}))));
                     }
-                    Err(e) => {
-                        tracing::error!("Stream error: {e}");
-                        break;
+                    maybe_event = response_stream.next() => {
+                        match maybe_event {
+                            Some(Ok(ev)) => {
+                                let sse_chunk = translator.translate(&ev);
+                                if !sse_chunk.is_empty() {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::from(sse_chunk));
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!("Stream error: {e}");
+                                had_stream_error = true;
+                                let msg = format!("Stream error: {e}");
+                                let error_payload = anthropic_error_body("api_error", &msg, &req_ctx_for_stream.request_id);
+                                yield Ok::<Bytes, std::io::Error>(Bytes::from(format_sse("error", &error_payload)));
+                                break;
+                            }
+                            None => break,
+                        }
                     }
                 }
             }
@@ -1036,15 +1284,14 @@ async fn handle_messages(
                 model: model_clone,
                 reasoning_effort: log_effort,
                 reasoning_source: reasoning_source.to_string(),
-
                 items: 0,
                 tools: Vec::new(),
                 streaming: true,
-                status: Some(200),
+                status: Some(if had_stream_error { 502 } else { 200 }),
                 stop_reason: Some(translator.stop_reason().to_string()),
                 input_tokens: translator.input_tokens(),
                 output_tokens: translator.output_tokens(),
-                error: None,
+                error: if had_stream_error { Some("stream_error".to_string()) } else { None },
             };
             let response_line = entry.response_line();
             append_log(&log_buffer, entry).await;
@@ -1052,8 +1299,7 @@ async fn handle_messages(
         };
 
         let body = Body::from_stream(sse_stream);
-        Response::builder()
-            .status(200)
+        attach_correlation_headers(Response::builder().status(200), &req_ctx)
             .header("content-type", "text/event-stream")
             .header("cache-control", "no-cache")
             .header("connection", "keep-alive")
@@ -1081,7 +1327,13 @@ async fn handle_messages(
                         Some(502),
                     )
                     .await;
-                    return (StatusCode::BAD_GATEWAY, msg).into_response();
+                    return anthropic_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        msg,
+                        &req_ctx,
+                        Some(stream_retry_hints()),
+                    );
                 }
             }
         }
@@ -1097,6 +1349,9 @@ async fn handle_messages(
         }
 
         let message = translator.build_response(&req.model);
+        let body = Body::from(
+            serde_json::to_vec(&message).unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec()),
+        );
         let entry = HttpLogEntry {
             timestamp: Utc::now(),
             model: resolved_model.clone(),
@@ -1114,7 +1369,10 @@ async fn handle_messages(
         tracing::info!("{}", entry.response_line());
         append_log(&state.log_buffer, entry).await;
 
-        axum::Json(message).into_response()
+        attach_correlation_headers(Response::builder().status(200), &req_ctx)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     }
 }
 
@@ -1139,7 +1397,14 @@ async fn cache_session(
     let mut c = cache.lock().await;
     let now = std::time::Instant::now();
     c.retain(|_, e| now.duration_since(e.last_used) < SESSION_CACHE_TTL);
-    c.insert(sid.to_owned(), SessionCacheEntry { client, last_used: now, key });
+    c.insert(
+        sid.to_owned(),
+        SessionCacheEntry {
+            client,
+            last_used: now,
+            key,
+        },
+    );
 }
 
 async fn log_error(
@@ -1198,8 +1463,14 @@ struct StreamTranslator {
 
 #[derive(Debug)]
 enum BlockState {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
 }
 
 impl StreamTranslator {
@@ -1219,7 +1490,11 @@ impl StreamTranslator {
     }
 
     fn stop_reason(&self) -> &'static str {
-        if self.has_function_call { "tool_use" } else { "end_turn" }
+        if self.has_function_call {
+            "tool_use"
+        } else {
+            "end_turn"
+        }
     }
 
     fn input_tokens(&self) -> Option<u32> {
@@ -1305,7 +1580,8 @@ impl StreamTranslator {
                 "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 }
             }
         });
-        format_sse("message_start", &message_start) + &format_sse("ping", &serde_json::json!({"type": "ping"}))
+        format_sse("message_start", &message_start)
+            + &format_sse("ping", &serde_json::json!({"type": "ping"}))
     }
 
     fn handle_item_added(&mut self, item: &ResponseItem, emit_sse: bool) -> String {
@@ -1315,7 +1591,9 @@ impl StreamTranslator {
                 let idx = self.next_block;
                 self.next_block += 1;
                 self.current_text_block = Some(idx);
-                self.blocks.push(BlockState::Text { text: String::new() });
+                self.blocks.push(BlockState::Text {
+                    text: String::new(),
+                });
 
                 if !emit_sse {
                     return String::new();
@@ -1433,7 +1711,8 @@ impl StreamTranslator {
             return String::new();
         }
 
-        let reported_input_tokens = (self.input_tokens as f64 * self.context_window_scale).round() as u32;
+        let reported_input_tokens =
+            (self.input_tokens as f64 * self.context_window_scale).round() as u32;
         let stop_reason = self.stop_reason();
         let message_delta = serde_json::json!({
             "type": "message_delta",
@@ -1454,7 +1733,7 @@ impl StreamTranslator {
                 }
                 BlockState::ToolUse { id, name, input } => {
                     let parsed_input: Value = serde_json::from_str(input)
-                        .unwrap_or(serde_json::json!({}));
+                        .unwrap_or_else(|_| serde_json::json!({ "_raw": input }));
                     content.push(serde_json::json!({
                         "type": "tool_use",
                         "id": id,
@@ -1464,7 +1743,8 @@ impl StreamTranslator {
                 }
             }
         }
-        let reported_input_tokens = (self.input_tokens as f64 * self.context_window_scale).round() as u32;
+        let reported_input_tokens =
+            (self.input_tokens as f64 * self.context_window_scale).round() as u32;
         serde_json::json!({
             "id": self.message_id,
             "type": "message",

@@ -4658,7 +4658,10 @@ impl App {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
-            AppEvent::OpenAllModelsPopup { models, named_model } => {
+            AppEvent::OpenAllModelsPopup {
+                models,
+                named_model,
+            } => {
                 self.chat_widget.open_all_models_popup(models, named_model);
             }
             AppEvent::OpenFullAccessConfirmation {
@@ -5712,7 +5715,11 @@ impl App {
                     crate::logs_overlay::LogsOverlay::new(self.http_server_log_buffer.clone()),
                 ));
             }
-            AppEvent::PersistNamedModelSelection { name, model, effort } => {
+            AppEvent::PersistNamedModelSelection {
+                name,
+                model,
+                effort,
+            } => {
                 match ConfigEditsBuilder::new(&self.config.codex_home)
                     .set_http_model_name(&name, &model, effort)
                     .apply()

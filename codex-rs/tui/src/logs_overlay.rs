@@ -129,9 +129,7 @@ impl LogsOverlay {
         Span::from("/ ".repeat(area.width as usize / 2))
             .dim()
             .render_ref(area, buf);
-        Span::from(header.to_string())
-            .dim()
-            .render_ref(area, buf);
+        Span::from(header.to_string()).dim().render_ref(area, buf);
 
         // Content area (leave one row for header, two for footer).
         let content_area = Rect {
@@ -218,7 +216,9 @@ impl LogsOverlay {
                 } else if KEY_PAGE_UP.is_press(key_event) {
                     let page = Self::page_height_for_area(tui.terminal.viewport_area);
                     self.follow_bottom = false;
-                    self.scroll_offset = self.effective_scroll_offset(max_scroll).saturating_sub(page);
+                    self.scroll_offset = self
+                        .effective_scroll_offset(max_scroll)
+                        .saturating_sub(page);
                 } else if KEY_PAGE_DOWN.is_press(key_event) || KEY_SPACE.is_press(key_event) {
                     let page = Self::page_height_for_area(tui.terminal.viewport_area);
                     self.scroll_offset = self
@@ -240,7 +240,8 @@ impl LogsOverlay {
                     self.render(frame.area(), frame.buffer);
                 })?;
                 if !self.is_done {
-                    tui.frame_requester().schedule_frame_in(Duration::from_millis(50));
+                    tui.frame_requester()
+                        .schedule_frame_in(Duration::from_millis(50));
                 }
             }
             _ => {}
