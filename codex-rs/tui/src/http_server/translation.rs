@@ -153,14 +153,25 @@ pub(super) fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseI
                             };
                             text_content.push(item);
                         }
-                        AnthropicBlock::Document { title } => {
-                            let label = title.as_deref().unwrap_or("untitled");
-                            let placeholder =
-                                format!("[Document: {label} — not supported by this proxy]");
+                        AnthropicBlock::Document { title, source } => {
+                            // Extract text content when source type is "text",
+                            // otherwise fall back to a placeholder so the
+                            // conversation history stays structurally valid.
+                            let text = source
+                                .as_ref()
+                                .filter(|s| {
+                                    s.get("type").and_then(Value::as_str) == Some("text")
+                                })
+                                .and_then(|s| s.get("data").and_then(Value::as_str))
+                                .map(str::to_string)
+                                .unwrap_or_else(|| {
+                                    let label = title.as_deref().unwrap_or("untitled");
+                                    format!("[Document: {label} — not supported by this proxy]")
+                                });
                             let item = if msg.role == "user" {
-                                ContentItem::InputText { text: placeholder }
+                                ContentItem::InputText { text }
                             } else {
-                                ContentItem::OutputText { text: placeholder }
+                                ContentItem::OutputText { text }
                             };
                             text_content.push(item);
                         }
@@ -197,7 +208,10 @@ pub(super) fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseI
                         AnthropicBlock::ToolResult {
                             tool_use_id,
                             content,
+                            is_error,
                         } => {
+                            // is_error=true → success=false; absent/false → None (unknown).
+                            let success = is_error.map(|e| !e);
                             // Flush accumulated text blocks first.
                             if !text_content.is_empty() {
                                 items.push(ResponseItem::Message {
@@ -214,7 +228,7 @@ pub(super) fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseI
                                         call_id: tool_use_id.clone(),
                                         output: FunctionCallOutputPayload {
                                             body: FunctionCallOutputBody::Text(String::new()),
-                                            success: None,
+                                            success,
                                         },
                                     });
                                 }
@@ -223,7 +237,7 @@ pub(super) fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseI
                                         call_id: tool_use_id.clone(),
                                         output: FunctionCallOutputPayload {
                                             body: FunctionCallOutputBody::Text(t.clone()),
-                                            success: None,
+                                            success,
                                         },
                                     });
                                 }
@@ -247,9 +261,12 @@ pub(super) fn translate_messages(messages: &[AnthropicMessage]) -> Vec<ResponseI
                                         .collect();
                                     items.push(ResponseItem::FunctionCallOutput {
                                         call_id: tool_use_id.clone(),
-                                        output: FunctionCallOutputPayload::from_content_items(
-                                            content_items,
-                                        ),
+                                        output: FunctionCallOutputPayload {
+                                            body: FunctionCallOutputBody::ContentItems(
+                                                content_items,
+                                            ),
+                                            success,
+                                        },
                                     });
                                 }
                             }

@@ -79,6 +79,9 @@ pub(super) enum AnthropicBlock {
         tool_use_id: String,
         #[serde(default)]
         content: AnthropicToolResultContent,
+        /// When true the tool call failed; mapped to success=false in OpenAI format.
+        #[serde(default)]
+        is_error: Option<bool>,
     },
     Thinking {
         #[allow(dead_code)]
@@ -90,6 +93,9 @@ pub(super) enum AnthropicBlock {
     Document {
         #[serde(default)]
         title: Option<String>,
+        /// Raw source object; text-type sources have their content extracted.
+        #[serde(default)]
+        source: Option<Value>,
     },
     #[serde(other)]
     Unknown,

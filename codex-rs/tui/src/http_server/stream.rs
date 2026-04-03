@@ -13,6 +13,8 @@ pub(super) struct StreamTranslator {
     next_block: usize,
     /// Block index currently receiving text deltas.
     current_text_block: Option<usize>,
+    /// Active thinking block: (block_index, summary_index).
+    current_thinking_block: Option<(usize, i64)>,
     /// Map from function call_id → block index.
     call_id_to_block: HashMap<String, usize>,
     /// True if at least one function_call was received.
@@ -38,6 +40,9 @@ pub(super) enum BlockState {
         name: String,
         input: String,
     },
+    Thinking {
+        text: String,
+    },
 }
 
 impl StreamTranslator {
@@ -47,6 +52,7 @@ impl StreamTranslator {
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
             next_block: 0,
             current_text_block: None,
+            current_thinking_block: None,
             call_id_to_block: HashMap::new(),
             has_function_call: false,
             input_tokens: 0,
@@ -68,8 +74,10 @@ impl StreamTranslator {
         self.stop_reason_override = Some(reason);
     }
 
-    pub(super) fn terminate_with_reason(&self, stop_reason: &str) -> String {
+    pub(super) fn terminate_with_reason(&mut self, stop_reason: &str) -> String {
         let mut out = String::new();
+        // Close any open thinking block before the text block.
+        out += &self.close_thinking_block(true);
         if let Some(idx) = self.current_text_block {
             out += &format_sse("content_block_stop", &serde_json::json!({"type": "content_block_stop", "index": idx}));
         }
@@ -115,6 +123,12 @@ impl StreamTranslator {
             ResponseEvent::OutputItemDone(item) => {
                 self.handle_item_done(item, false);
             }
+            ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+                self.handle_thinking_part_added(*summary_index, false);
+            }
+            ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
+                self.handle_thinking_delta(delta, false);
+            }
             ResponseEvent::Completed { token_usage, .. } => {
                 if let Some(usage) = token_usage {
                     self.input_tokens = usage.input_tokens as u32;
@@ -136,6 +150,12 @@ impl StreamTranslator {
             ResponseEvent::OutputItemAdded(item) => self.handle_item_added(item, true),
             ResponseEvent::OutputTextDelta(delta) => self.handle_text_delta(delta, true),
             ResponseEvent::OutputItemDone(item) => self.handle_item_done(item, true),
+            ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+                self.handle_thinking_part_added(*summary_index, true)
+            }
+            ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
+                self.handle_thinking_delta(delta, true)
+            }
             ResponseEvent::Completed { token_usage, .. } => {
                 if let Some(usage) = token_usage {
                     self.input_tokens = usage.input_tokens as u32;
@@ -244,6 +264,84 @@ impl StreamTranslator {
         format_sse("content_block_delta", &content_delta)
     }
 
+    /// Opens a new thinking block for `summary_index`, closing any previous
+    /// thinking block with a different index first.
+    fn handle_thinking_part_added(&mut self, summary_index: i64, emit_sse: bool) -> String {
+        let mut out = String::new();
+
+        // Close the previous thinking block if it belongs to a different part.
+        if let Some((prev_idx, prev_summary)) = self.current_thinking_block {
+            if prev_summary != summary_index {
+                self.current_thinking_block = None;
+                if emit_sse {
+                    out += &format_sse(
+                        "content_block_stop",
+                        &serde_json::json!({"type": "content_block_stop", "index": prev_idx}),
+                    );
+                }
+            } else {
+                // Same part already open — nothing to do.
+                return out;
+            }
+        }
+
+        let idx = self.next_block;
+        self.next_block += 1;
+        self.current_thinking_block = Some((idx, summary_index));
+        self.blocks.push(BlockState::Thinking { text: String::new() });
+
+        if emit_sse {
+            out += &format_sse(
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            );
+        }
+
+        out
+    }
+
+    fn handle_thinking_delta(&mut self, delta: &str, emit_sse: bool) -> String {
+        let Some((idx, _)) = self.current_thinking_block else {
+            return String::new();
+        };
+
+        if let Some(BlockState::Thinking { text }) = self.blocks.get_mut(idx) {
+            text.push_str(delta);
+        }
+
+        if !emit_sse {
+            return String::new();
+        }
+
+        format_sse(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "thinking_delta", "thinking": delta }
+            }),
+        )
+    }
+
+    /// Close the active thinking block, if any. Returns an SSE
+    /// `content_block_stop` chunk when `emit_sse` is true.
+    fn close_thinking_block(&mut self, emit_sse: bool) -> String {
+        let Some((idx, _)) = self.current_thinking_block.take() else {
+            return String::new();
+        };
+        if !emit_sse {
+            return String::new();
+        }
+        format_sse(
+            "content_block_stop",
+            &serde_json::json!({"type": "content_block_stop", "index": idx}),
+        )
+    }
+
     fn handle_item_done(&mut self, item: &ResponseItem, emit_sse: bool) -> String {
         match item {
             ResponseItem::Message { .. } => {
@@ -288,11 +386,15 @@ impl StreamTranslator {
                 format_sse("content_block_delta", &args_delta)
                     + &format_sse("content_block_stop", &stop)
             }
+            ResponseItem::Reasoning { .. } => self.close_thinking_block(emit_sse),
             _ => String::new(),
         }
     }
 
-    fn handle_completed(&self, emit_sse: bool) -> String {
+    fn handle_completed(&mut self, emit_sse: bool) -> String {
+        // Always close any dangling thinking block before message_delta.
+        let thinking_close = self.close_thinking_block(emit_sse);
+
         if !emit_sse {
             return String::new();
         }
@@ -306,7 +408,9 @@ impl StreamTranslator {
             "usage": { "output_tokens": self.output_tokens, "input_tokens": reported_input_tokens, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0 }
         });
         let message_stop = serde_json::json!({ "type": "message_stop" });
-        format_sse("message_delta", &message_delta) + &format_sse("message_stop", &message_stop)
+        thinking_close
+            + &format_sse("message_delta", &message_delta)
+            + &format_sse("message_stop", &message_stop)
     }
 
     /// Build a complete non-streaming Anthropic response message.
@@ -327,6 +431,9 @@ impl StreamTranslator {
                         "input": parsed_input
                     }));
                 }
+                BlockState::Thinking { text } => {
+                    content.push(serde_json::json!({ "type": "thinking", "thinking": text }));
+                }
             }
         }
         let reported_input_tokens =
@@ -341,7 +448,9 @@ impl StreamTranslator {
             "stop_sequence": null,
             "usage": {
                 "input_tokens": reported_input_tokens,
-                "output_tokens": self.output_tokens
+                "output_tokens": self.output_tokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
             }
         })
     }
