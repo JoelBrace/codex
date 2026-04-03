@@ -86,6 +86,9 @@ pub(super) async fn handle_messages(
         }
     };
     let stream_mode = req.stream;
+    // Capture the model string Claude Code sent so we can echo it back in
+    // responses — Claude Code uses this for telemetry and routing checks.
+    let request_model = req.model.clone();
 
     let session_id = headers
         .get("x-codex-session-id")
@@ -285,8 +288,10 @@ pub(super) async fn handle_messages(
         let model_clone = resolved_model.clone();
 
         let req_ctx_for_stream = req_ctx.clone();
+        let request_model_for_stream = request_model.clone();
+        let estimated_tokens = req.estimate_input_tokens();
         let sse_stream = async_stream::stream! {
-            let mut translator = StreamTranslator::new(model_clone.clone(), context_window_scale);
+            let mut translator = StreamTranslator::new(request_model_for_stream, context_window_scale, estimated_tokens);
             let mut had_stream_error = false;
             let mut ping_interval = tokio::time::interval(Duration::from_secs(STREAM_PING_INTERVAL_SECS));
             ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -362,7 +367,8 @@ pub(super) async fn handle_messages(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     } else {
         // --- Non-streaming: accumulate and return JSON ---
-        let mut translator = StreamTranslator::new(resolved_model.clone(), context_window_scale);
+        // Non-streaming: real tokens arrive before build_response, so no estimate needed.
+        let mut translator = StreamTranslator::new(request_model.clone(), context_window_scale, 0);
         while let Some(event) = response_stream.next().await {
             match event {
                 Ok(ev) => {
@@ -408,7 +414,7 @@ pub(super) async fn handle_messages(
             cache_session(&state.session_cache, sid, client, key).await;
         }
 
-        let message = translator.build_response(&resolved_model);
+        let message = translator.build_response(&request_model);
         let body = Body::from(
             serde_json::to_vec(&message).unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec()),
         );

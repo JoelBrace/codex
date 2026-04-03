@@ -11,7 +11,10 @@ pub(super) struct StreamTranslator {
     message_id: String,
     /// Next block index to assign.
     next_block: usize,
-    /// Block index currently receiving text deltas.
+    /// Block index allocated for a text block whose `content_block_start` has
+    /// not yet been emitted (waiting for the first text delta).
+    pending_text_block: Option<usize>,
+    /// Block index currently receiving text deltas (start already emitted).
     current_text_block: Option<usize>,
     /// Active thinking block: (block_index, summary_index).
     current_thinking_block: Option<(usize, i64)>,
@@ -46,16 +49,17 @@ pub(super) enum BlockState {
 }
 
 impl StreamTranslator {
-    pub(super) fn new(model_slug: String, context_window_scale: f64) -> Self {
+    pub(super) fn new(model_slug: String, context_window_scale: f64, estimated_input_tokens: u32) -> Self {
         Self {
             model_slug,
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
             next_block: 0,
+            pending_text_block: None,
             current_text_block: None,
             current_thinking_block: None,
             call_id_to_block: HashMap::new(),
             has_function_call: false,
-            input_tokens: 0,
+            input_tokens: estimated_input_tokens,
             output_tokens: 0,
             blocks: Vec::new(),
             context_window_scale,
@@ -193,24 +197,16 @@ impl StreamTranslator {
     fn handle_item_added(&mut self, item: &ResponseItem, emit_sse: bool) -> String {
         match item {
             ResponseItem::Message { .. } => {
-                // Open a text block.
+                // Allocate a text block but defer emitting content_block_start
+                // until the first delta arrives. If no delta ever comes (tool-
+                // only responses), we suppress the empty block entirely.
                 let idx = self.next_block;
                 self.next_block += 1;
-                self.current_text_block = Some(idx);
+                self.pending_text_block = Some(idx);
                 self.blocks.push(BlockState::Text {
                     text: String::new(),
                 });
-
-                if !emit_sse {
-                    return String::new();
-                }
-
-                let block_start = serde_json::json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": { "type": "text", "text": "" }
-                });
-                format_sse("content_block_start", &block_start)
+                String::new()
             }
             ResponseItem::FunctionCall { name, call_id, .. } => {
                 self.has_function_call = true;
@@ -244,6 +240,28 @@ impl StreamTranslator {
     }
 
     fn handle_text_delta(&mut self, delta: &str, emit_sse: bool) -> String {
+        // Promote a pending block to active on the first delta.
+        if let Some(pending_idx) = self.pending_text_block.take() {
+            self.current_text_block = Some(pending_idx);
+            if emit_sse {
+                let block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": pending_idx,
+                    "content_block": { "type": "text", "text": "" }
+                });
+                let start_sse = format_sse("content_block_start", &block_start);
+                if let Some(BlockState::Text { text }) = self.blocks.get_mut(pending_idx) {
+                    text.push_str(delta);
+                }
+                let content_delta = serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": pending_idx,
+                    "delta": { "type": "text_delta", "text": delta }
+                });
+                return start_sse + &format_sse("content_block_delta", &content_delta);
+            }
+        }
+
         let Some(idx) = self.current_text_block else {
             return String::new();
         };
@@ -327,8 +345,8 @@ impl StreamTranslator {
         )
     }
 
-    /// Close the active thinking block, if any. Returns an SSE
-    /// `content_block_stop` chunk when `emit_sse` is true.
+    /// Close the active thinking block, if any. Returns SSE chunks for the
+    /// `signature_delta` and `content_block_stop` when `emit_sse` is true.
     fn close_thinking_block(&mut self, emit_sse: bool) -> String {
         let Some((idx, _)) = self.current_thinking_block.take() else {
             return String::new();
@@ -336,15 +354,34 @@ impl StreamTranslator {
         if !emit_sse {
             return String::new();
         }
-        format_sse(
+        // Emit a proxy signature so Claude Code's SDK validation passes.
+        let signature = format!("proxy_{idx:04}");
+        let sig_delta = format_sse(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "signature_delta", "signature": signature }
+            }),
+        );
+        let stop = format_sse(
             "content_block_stop",
             &serde_json::json!({"type": "content_block_stop", "index": idx}),
-        )
+        );
+        sig_delta + &stop
     }
 
     fn handle_item_done(&mut self, item: &ResponseItem, emit_sse: bool) -> String {
         match item {
             ResponseItem::Message { .. } => {
+                // If the block never received a delta, discard it — no start
+                // was emitted so no stop is needed either.
+                if let Some(pending_idx) = self.pending_text_block.take() {
+                    self.blocks.truncate(pending_idx);
+                    self.next_block = pending_idx;
+                    return String::new();
+                }
+
                 let Some(idx) = self.current_text_block.take() else {
                     return String::new();
                 };
@@ -432,7 +469,11 @@ impl StreamTranslator {
                     }));
                 }
                 BlockState::Thinking { text } => {
-                    content.push(serde_json::json!({ "type": "thinking", "thinking": text }));
+                    content.push(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": text,
+                        "signature": format!("proxy_{i:04}", i = content.len())
+                    }));
                 }
             }
         }

@@ -33,6 +33,45 @@ pub(super) struct AnthropicRequest {
     pub(super) betas: Option<Vec<String>>,
 }
 
+impl AnthropicRequest {
+    /// Rough token count estimate based on character length (chars / 4).
+    /// Used to populate `message_start` before the real count arrives with
+    /// the `Completed` event at the end of the stream.
+    pub(super) fn estimate_input_tokens(&self) -> u32 {
+        let mut chars = 0usize;
+        match &self.system {
+            Some(Value::String(s)) => chars += s.len(),
+            Some(Value::Array(blocks)) => {
+                for b in blocks {
+                    if let Some(t) = b.get("text").and_then(Value::as_str) {
+                        chars += t.len();
+                    }
+                }
+            }
+            _ => {}
+        }
+        for msg in &self.messages {
+            match &msg.content {
+                AnthropicContent::Text(t) => chars += t.len(),
+                AnthropicContent::Blocks(blocks) => {
+                    for block in blocks {
+                        match block {
+                            AnthropicBlock::Text { text } => chars += text.len(),
+                            AnthropicBlock::ToolResult { content, .. } => {
+                                if let AnthropicToolResultContent::Text(t) = content {
+                                    chars += t.len();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        (chars / 4) as u32
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct AnthropicMessage {
     pub(super) role: String,
