@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use codex_core::AuthManager;
 use codex_core::ModelClient;
-use codex_core::ModelProviderInfo;
+use codex_login::AuthManager;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_core::Prompt;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::openai_models::ModelInfo;
@@ -35,9 +35,10 @@ pub(super) fn create_proxy_client(
     ModelClient::new(
         Some(auth_manager.clone()),
         ThreadId::new(), // stable conversation_id for the slot lifetime
+        String::new(),   // installation_id
         provider.clone(),
         SessionSource::Cli,
-        None, // model_verbosity
+        None,  // model_verbosity
         enable_request_compression,
         false, // include_timing_metrics
         beta_features_header,

@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
-use codex_core::AuthManager;
 use codex_core::ModelClient;
-use codex_core::ModelProviderInfo;
+use codex_login::AuthManager;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::openai_models::ModelInfo;

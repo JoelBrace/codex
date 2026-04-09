@@ -56,8 +56,8 @@ impl Prompt {
         description: String,
         parameters: serde_json::Value,
     ) -> anyhow::Result<()> {
-        use crate::tools::spec::parse_tool_input_schema;
-        use self::tools::{ResponsesApiTool, ToolSpec};
+        use codex_tools::parse_tool_input_schema;
+        use codex_tools::ResponsesApiTool;
         let schema = parse_tool_input_schema(&parameters)
             .map_err(|e| anyhow::anyhow!("Invalid tool schema for '{}': {}", name, e))?;
         self.tools.push(ToolSpec::Function(ResponsesApiTool {
@@ -76,7 +76,6 @@ impl Prompt {
     /// `live` = true → `WebSearchMode::Live` (fresh results)
     /// `live` = false → `WebSearchMode::Cached`
     pub fn add_web_search_tool(&mut self, live: bool) {
-        use self::tools::ToolSpec;
         self.tools.push(ToolSpec::WebSearch {
             external_web_access: Some(live),
             search_content_types: None,

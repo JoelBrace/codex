@@ -326,5 +326,6 @@ pub(super) fn proxy_model_info(slug: &str) -> ModelInfo {
         supports_image_detail_original: false,
         web_search_tool_type: WebSearchToolType::Text,
         supports_search_tool: false,
+        additional_speed_tiers: Vec::new(),
     }
 }

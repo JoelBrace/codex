@@ -11,7 +11,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use chrono::Utc;
-use codex_core::error::CodexErr;
+use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use serde_json::Value;
 use tokio::time::Duration;

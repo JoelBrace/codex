@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "codex-analytics"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-app-server-protocol",
  "codex-git-utils",
@@ -1605,27 +1605,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-artifacts"
-version = "1.0.2"
-dependencies = [
- "codex-package-manager",
- "flate2",
- "pretty_assertions",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "url",
- "which",
- "wiremock",
- "zip",
-]
-
-[[package]]
 name = "codex-async-utils"
 version = "1.0.2"
 dependencies = [
@@ -1834,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "codex-cloud-tasks-mock-client"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1844,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "codex-code-mode"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "async-trait",
  "pretty_assertions",
@@ -1858,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "codex-collaboration-mode-templates"
-version = "0.0.0"
+version = "1.0.2"
 
 [[package]]
 name = "codex-config"
@@ -2025,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "codex-core-skills"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "codex-analytics",
@@ -2224,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "codex-git-utils"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "assert_matches",
  "codex-utils-absolute-path",
@@ -2261,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "codex-instructions"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-protocol",
  "pretty_assertions",
@@ -2356,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mcp"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2417,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "codex-model-provider-info"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-api",
  "codex-app-server-protocol",
@@ -2434,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "codex-models-manager"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2546,7 +2525,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-package-manager"
+name = "codex-plugin"
 version = "1.0.2"
 dependencies = [
  "codex-utils-absolute-path",
@@ -2604,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "codex-realtime-webrtc"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "libwebrtc",
  "thiserror 2.0.18",
@@ -2613,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "codex-response-debug-context"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "base64 0.22.1",
  "codex-api",
@@ -2675,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "codex-rollout"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2700,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "codex-sandboxing"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-network-proxy",
  "codex-protocol",
@@ -2830,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "codex-tools"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-app-server-protocol",
  "codex-code-mode",
@@ -3045,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-output-truncation"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-protocol",
  "codex-utils-string",
@@ -3054,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-path"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-utils-absolute-path",
  "dunce",
@@ -3064,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-plugins"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "codex-login",
  "serde",
@@ -3144,14 +3123,14 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-template"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "pretty_assertions",
 ]
 
 [[package]]
 name = "codex-v8-poc"
-version = "0.0.0"
+version = "1.0.2"
 dependencies = [
  "pretty_assertions",
  "v8",

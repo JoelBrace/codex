@@ -149,7 +149,6 @@ use std::time::Instant;
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
@@ -4617,7 +4616,7 @@ impl App {
             }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort);
-                self.refresh_status_surfaces();
+                self.refresh_status_line();
                 self.http_server_dynamic_config
                     .write()
                     .await
@@ -4625,7 +4624,7 @@ impl App {
             }
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
-                self.refresh_status_surfaces();
+                self.refresh_status_line();
                 let mut cfg = self.http_server_dynamic_config.write().await;
                 if let Some(model_info) = self.chat_widget.try_get_model_info(&model) {
                     cfg.set_model_with_info(model, model_info);
@@ -5686,8 +5685,13 @@ impl App {
             AppEvent::SetHttpServerEnabled(enable) => {
                 if enable {
                     if self.http_server_handle.is_none() {
+                        let auth_manager = Arc::new(codex_login::AuthManager::new(
+                            self.config.codex_home.clone(),
+                            false,
+                            codex_config::types::AuthCredentialsStoreMode::default(),
+                        ));
                         let state = Arc::new(crate::http_server::HttpServerState::new(
-                            self.auth_manager.clone(),
+                            auth_manager,
                             self.http_server_dynamic_config.clone(),
                             self.http_server_log_buffer.clone(),
                             self.session_telemetry.clone(),
