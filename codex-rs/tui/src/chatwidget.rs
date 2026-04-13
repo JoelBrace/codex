@@ -956,6 +956,7 @@ pub(crate) struct ChatWidget {
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
     last_non_retry_error: Option<(String, String)>,
     http_server_running: bool,
+    http_server_port: u16,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -4722,6 +4723,7 @@ impl ChatWidget {
             last_rendered_user_message_event: None,
             last_non_retry_error: None,
             http_server_running: false,
+            http_server_port: 8082,
         };
 
         widget
@@ -8835,8 +8837,10 @@ impl ChatWidget {
             "on" => {
                 self.app_event_tx.send(AppEvent::SetHttpServerEnabled(true));
                 self.add_info_message(
-                    "HTTP server started at localhost:8082 — POST /v1/messages is available"
-                        .to_string(),
+                    format!(
+                        "HTTP server started at 0.0.0.0:{} — POST /v1/messages is available",
+                        self.http_server_port
+                    ),
                     None,
                 );
             }
@@ -8847,8 +8851,10 @@ impl ChatWidget {
             }
             "status" => {
                 let msg = if self.http_server_running {
-                    "HTTP server is running at localhost:8082 — POST /v1/messages is available"
-                        .to_string()
+                    format!(
+                        "HTTP server is running at 0.0.0.0:{} — POST /v1/messages is available",
+                        self.http_server_port
+                    )
                 } else {
                     "HTTP server is stopped".to_string()
                 };
@@ -8867,6 +8873,10 @@ impl ChatWidget {
 
     pub(crate) fn set_http_server_running(&mut self, running: bool) {
         self.http_server_running = running;
+    }
+
+    pub(crate) fn set_http_server_port(&mut self, port: u16) {
+        self.http_server_port = port;
     }
 
     pub(crate) fn open_experimental_popup(&mut self) {

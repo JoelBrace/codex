@@ -1363,6 +1363,7 @@ async fn run_ratatui_app(
         prompt,
         images,
         no_alt_screen,
+        http_server_port,
         ..
     } = cli;
 
@@ -1408,6 +1409,7 @@ async fn run_ratatui_app(
         remote_url,
         remote_auth_token,
         environment_manager,
+        http_server_port,
     )
     .await;
 

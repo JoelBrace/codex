@@ -115,6 +115,10 @@ pub struct Cli {
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
+    /// Port for the local HTTP server (default: 8082).
+    #[arg(long = "port", default_value_t = 8082)]
+    pub http_server_port: u16,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

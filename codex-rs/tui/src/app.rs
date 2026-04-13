@@ -1011,6 +1011,7 @@ pub(crate) struct App {
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
     http_server_handle: Option<tokio::task::JoinHandle<()>>,
+    http_server_port: u16,
     /// Bounded ring buffer of HTTP server log entries shared with the TUI overlay.
     http_server_log_buffer: Arc<Mutex<VecDeque<crate::http_server::HttpLogEntry>>>,
     /// Dynamic config for the HTTP proxy server (model, provider, reasoning effort).
@@ -3605,6 +3606,7 @@ impl App {
         remote_app_server_url: Option<String>,
         remote_app_server_auth_token: Option<String>,
         environment_manager: Arc<EnvironmentManager>,
+        http_server_port: u16,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
@@ -3884,6 +3886,7 @@ impl App {
                 .set_named_models(named_models);
         }
 
+        chat_widget.set_http_server_port(http_server_port);
         let mut app = Self {
             model_catalog,
             session_telemetry: session_telemetry.clone(),
@@ -3925,6 +3928,7 @@ impl App {
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             http_server_handle: None,
+            http_server_port,
             http_server_log_buffer,
             http_server_dynamic_config,
         };
@@ -5697,9 +5701,10 @@ impl App {
                             self.session_telemetry.clone(),
                         ));
                         let router = crate::http_server::build_router(state);
+                        let port = self.http_server_port;
                         let handle = tokio::spawn(async move {
                             if let Ok(listener) =
-                                tokio::net::TcpListener::bind("127.0.0.1:8082").await
+                                tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await
                             {
                                 let _ = axum::serve(listener, router).await;
                             }
@@ -9471,6 +9476,7 @@ guardian_approval = true
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             http_server_handle: None,
+            http_server_port: 8082,
             http_server_log_buffer,
             http_server_dynamic_config,
         }
@@ -9546,6 +9552,7 @@ guardian_approval = true
                 pending_primary_events: VecDeque::new(),
                 pending_app_server_requests: PendingAppServerRequests::default(),
                 http_server_handle: None,
+                http_server_port: 8082,
                 http_server_log_buffer,
                 http_server_dynamic_config,
             },
