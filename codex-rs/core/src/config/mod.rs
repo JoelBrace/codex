@@ -2109,7 +2109,7 @@ impl Config {
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
             guardian_policy_config,
-            http_model_names: HashMap::new(),
+            http_model_names: parse_http_model_names(&cfg.http_model_names),
             model_reasoning_effort: config_profile
                 .model_reasoning_effort
                 .or(cfg.model_reasoning_effort),

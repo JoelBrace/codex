@@ -388,6 +388,11 @@ pub struct ConfigToml {
     pub experimental_use_freeform_apply_patch: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
+
+    /// Named model configurations for the HTTP proxy server.
+    /// Stored as flat key pairs: `<name>_model` and `<name>_reasoning_effort`.
+    #[serde(default)]
+    pub http_model_names: HashMap<String, String>,
 }
 
 impl From<ConfigToml> for UserSavedConfig {
