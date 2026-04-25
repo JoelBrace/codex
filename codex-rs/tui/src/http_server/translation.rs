@@ -67,11 +67,18 @@ pub(super) fn translate_request(req: &AnthropicRequest, _model: &str) -> anyhow:
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => {
             // Concatenate all text blocks in the system prompt array.
+            // Strip the Claude Code attribution header — it contains a
+            // per-request attestation token (cch=) that would bust prefix
+            // caching on codex's backend every turn.
             blocks
                 .iter()
                 .filter_map(|b| {
                     if b.get("type").and_then(Value::as_str) == Some("text") {
-                        b.get("text").and_then(Value::as_str).map(str::to_string)
+                        let text = b.get("text").and_then(Value::as_str)?;
+                        if text.starts_with("x-anthropic-billing-header") {
+                            return None;
+                        }
+                        Some(text.to_string())
                     } else {
                         None
                     }
